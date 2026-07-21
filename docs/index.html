@@ -1,0 +1,752 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>sightline: audit what your ArcGIS Online maps actually show</title>
+<meta name="description" content="A single-file Python tool that finds web maps containing layers their viewers cannot load. 336 maps in under three minutes." />
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='6' fill='%23f7f8fa'/%3E%3Ccircle cx='16' cy='16' r='7.5' fill='none' stroke='%231d4ed8' stroke-width='2.5'/%3E%3Ccircle cx='16' cy='16' r='2.5' fill='%231d4ed8'/%3E%3C/svg%3E" />
+<link rel="preconnect" href="https://fonts.googleapis.com" />
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
+<style>
+/* sightline docs */
+
+/* tokens */
+:root {
+  --color-paper:      oklch(98.5% 0.004 250);
+  --color-paper-2:    oklch(96.6% 0.005 250);
+  --color-ink:        oklch(24% 0.02 258);
+  --color-ink-2:      oklch(34% 0.018 257);
+  --color-ink-3:      oklch(52% 0.014 256);
+  /* Accent lightness is set by contrast, not by taste. L54 on cool paper clears 4.5:1 for
+     both 14px button text (5.00) and body links (4.92); the original L58 measured 4.24/4.17
+     and failed both. Dark grounds invert the requirement, so they get their own token. */
+  --color-accent:     oklch(54% 0.20 256);
+  --color-accent-2:   oklch(46% 0.20 256);
+  --color-accent-dark:oklch(68% 0.17 256);   /* on graphite: 5.94 card · 6.33 band */
+  --color-accent-ink: oklch(99% 0.003 250);
+  --color-accent-wash:oklch(54% 0.20 256 / 0.09);
+  --color-rule:       oklch(89% 0.008 252);
+  --color-rule-2:     oklch(82% 0.012 254);
+  --color-graphite:   oklch(22% 0.016 260);
+  --color-graphite-2: oklch(19% 0.016 260);
+  --color-graphite-rule: oklch(32% 0.018 260);
+  --color-on-graphite:   oklch(90% 0.008 254);
+  --color-on-graphite-2: oklch(66% 0.014 256);
+  --color-warn:       oklch(58% 0.15 45);
+  --color-focus:      oklch(58% 0.20 256);
+
+  --font-display: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-body:    "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono:    "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  --text-display: clamp(2.35rem, 5.2vw + 0.4rem, 4.1rem);
+  --text-h2:      clamp(1.5rem, 2.1vw + 0.85rem, 2.05rem);
+  --text-h3:      clamp(1.08rem, 0.6vw + 0.92rem, 1.24rem);
+  --text-lede:    clamp(1.02rem, 0.55vw + 0.9rem, 1.16rem);
+  --text-body:    1rem;
+  --text-sm:      0.875rem;
+  --text-xs:      0.78rem;
+  --text-mono-label: 0.72rem;
+
+  --space-2xs: 0.25rem; --space-xs: 0.5rem;  --space-sm: 0.75rem;
+  --space-md:  1rem;    --space-lg: 1.5rem;  --space-xl: 2.25rem;
+  --space-2xl: 3.5rem;  --space-3xl: 5.5rem; --space-4xl: 7.5rem;
+
+  --radius-sm: 6px; --radius-md: 10px;
+  --rule: 1px;
+  --measure: 68ch;
+  --ease-out: cubic-bezier(0.16, 1, 0.3, 1);
+  --dur-short: 140ms; --dur-mid: 600ms;
+  --z-nav: 100; --z-overlay: 200;
+}
+
+/* base */
+*, *::before, *::after { box-sizing: border-box; }
+html, body { overflow-x: clip; }
+html { -webkit-text-size-adjust: 100%; scroll-behavior: smooth; }
+@media (prefers-reduced-motion: reduce) { html { scroll-behavior: auto; } }
+body {
+  margin: 0; background: var(--color-paper); color: var(--color-ink-2);
+  font-family: var(--font-body); font-size: var(--text-body); font-weight: 400;
+  line-height: 1.65; -webkit-font-smoothing: antialiased;
+}
+h1, h2, h3 {
+  font-family: var(--font-display); color: var(--color-ink);
+  font-style: normal; line-height: 1.1; letter-spacing: -0.025em;
+  margin: 0; overflow-wrap: anywhere; min-width: 0;
+}
+p { margin: 0; }
+a { color: inherit; }
+code, pre, kbd { font-family: var(--font-mono); }
+
+.wrap { width: 100%; max-width: 1140px; margin-inline: auto; padding-inline: clamp(1rem, 4vw, 2rem); }
+.rule-top { border-top: var(--rule) solid var(--color-rule); }
+.mono-label {
+  font-family: var(--font-mono); font-size: var(--text-mono-label); font-weight: 500;
+  text-transform: uppercase; letter-spacing: 0.08em; color: var(--color-ink-3);
+}
+.accent { color: var(--color-accent); }
+
+:where(a, button, input, summary, [tabindex]):focus-visible {
+  outline: 2px solid var(--color-focus); outline-offset: 2px; border-radius: 3px;
+}
+
+/* reveal */
+.reveal { opacity: 0; transform: translateY(10px);
+  transition: opacity var(--dur-mid) var(--ease-out), transform var(--dur-mid) var(--ease-out); }
+.reveal.is-in { opacity: 1; transform: none; }
+@media (prefers-reduced-motion: reduce) {
+  .reveal { opacity: 1; transform: none; transition: none; }
+}
+
+/* N13 · nav with inline ⌘K pill */
+.nav {
+  position: sticky; top: 0; z-index: var(--z-nav);
+  background: color-mix(in oklab, var(--color-paper) 88%, transparent);
+  backdrop-filter: blur(10px); border-bottom: var(--rule) solid var(--color-rule);
+}
+.nav__in { display: flex; align-items: center; gap: var(--space-md);
+  min-height: 60px; padding-block: var(--space-xs); }
+.nav__mark {
+  font-family: var(--font-display); font-weight: 600; font-size: 1.02rem;
+  letter-spacing: -0.03em; color: var(--color-ink); text-decoration: none; white-space: nowrap;
+}
+.nav__mark::after {
+  content: ""; display: inline-block; width: 6px; height: 6px; margin-left: 7px;
+  border-radius: 1px; background: var(--color-accent); vertical-align: middle;
+}
+.nav__links { display: flex; gap: var(--space-md); margin-left: var(--space-sm); }
+.nav__links a {
+  font-size: var(--text-sm); color: var(--color-ink-2); text-decoration: none;
+  white-space: nowrap; padding-block: 4px; position: relative;
+}
+.nav__links a::after {
+  content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 1px;
+  background: var(--color-accent); transform: scaleX(0); transform-origin: left;
+  transition: transform var(--dur-short) var(--ease-out);
+}
+.nav__links a:hover::after { transform: scaleX(1); }
+.nav__spacer { flex: 1 1 auto; }
+.kbtn {
+  display: inline-flex; align-items: center; gap: var(--space-xs);
+  min-height: 36px; padding: 0 var(--space-sm);
+  background: var(--color-paper); border: var(--rule) solid var(--color-rule-2);
+  border-radius: var(--radius-sm); color: var(--color-ink-3);
+  font-family: var(--font-body); font-size: var(--text-sm); cursor: pointer;
+  white-space: nowrap; transition: border-color var(--dur-short) var(--ease-out);
+}
+.kbtn:hover { border-color: var(--color-accent); }
+kbd {
+  font-size: var(--text-xs); padding: 2px 5px; border-radius: 4px;
+  border: var(--rule) solid var(--color-rule-2); background: var(--color-paper-2);
+  color: var(--color-ink-3); line-height: 1;
+}
+.btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  min-height: 40px; padding: 0 var(--space-md); border-radius: var(--radius-sm);
+  font-family: var(--font-body); font-size: var(--text-sm); font-weight: 500;
+  text-decoration: none; white-space: nowrap; cursor: pointer;
+  border: var(--rule) solid transparent;
+  transition: background-color var(--dur-short) var(--ease-out),
+              border-color var(--dur-short) var(--ease-out),
+              color var(--dur-short) var(--ease-out);
+}
+.btn--primary { background: var(--color-accent); color: var(--color-accent-ink); }
+.btn--primary:hover { background: var(--color-accent-2); }
+.btn--ghost { border-color: var(--color-rule-2); color: var(--color-ink); }
+.btn--ghost:hover { border-color: var(--color-accent); color: var(--color-accent); }
+@media (max-width: 46rem) { .nav__links { display: none; } .kbtn__hint { display: none; } }
+/* WCAG AA: every hit target clears 44px on phones */
+@media (max-width: 40rem) {
+  .btn, .kbtn { min-height: 44px; }
+  .foot a { display: inline-flex; align-items: center; min-height: 44px; }
+  .foot__sep { display: none; }
+  .foot__in { gap: var(--space-xs) var(--space-md); }
+}
+
+/* hero: title left, terminal right */
+.hero { padding-block: clamp(var(--space-2xl), 7vw, var(--space-4xl)) var(--space-2xl); }
+.hero__grid {
+  display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-xl);
+  align-items: start;
+}
+@media (min-width: 62rem) {
+  .hero__grid { grid-template-columns: minmax(0, 0.92fr) minmax(0, 1.08fr); gap: var(--space-2xl); }
+}
+h1 { font-size: var(--text-display); font-weight: 600; margin-bottom: var(--space-md); }
+.hero__lede { font-size: var(--text-lede); color: var(--color-ink-2); max-width: 46ch; }
+.hero__q {
+  margin-top: var(--space-lg); padding-left: var(--space-md);
+  border-left: 2px solid var(--color-accent); color: var(--color-ink);
+  font-size: var(--text-lede);
+}
+.hero__cta { display: flex; flex-wrap: wrap; gap: var(--space-sm); margin-top: var(--space-xl); }
+.hero__meta { margin-top: var(--space-lg); }
+
+/* code card: typographic frame, no window chrome */
+.code {
+  background: var(--color-graphite); border: var(--rule) solid var(--color-graphite-rule);
+  border-radius: var(--radius-md); overflow: hidden;
+  box-shadow: 0 1px 2px oklch(24% 0.02 258 / 0.06);
+}
+.code__bar {
+  display: flex; align-items: center; justify-content: space-between; gap: var(--space-sm);
+  padding: var(--space-xs) var(--space-md);
+  border-bottom: var(--rule) solid var(--color-graphite-rule);
+  color: var(--color-on-graphite-2);
+}
+.code__name { font-family: var(--font-mono); font-size: var(--text-mono-label);
+  text-transform: uppercase; letter-spacing: 0.08em; }
+.chip {
+  font-family: var(--font-mono); font-size: var(--text-mono-label); font-weight: 500;
+  letter-spacing: 0.06em; color: var(--color-accent-dark);
+  border: var(--rule) solid var(--color-accent-dark); border-radius: 4px; padding: 1px 6px;
+}
+.code pre {
+  margin: 0; padding: var(--space-md); overflow-x: auto;
+  font-size: var(--text-sm); line-height: 1.7; color: var(--color-on-graphite);
+  tab-size: 2;
+}
+.code .c-dim  { color: var(--color-on-graphite-2); }
+.code .c-key  { color: var(--color-accent-dark); }
+.code .c-warn { color: var(--color-warn); }
+
+/* sections */
+section { scroll-margin-top: 76px; }
+.sec { padding-block: var(--space-3xl); }
+.sec--tight { padding-block: var(--space-2xl); }
+.sec__head { max-width: var(--measure); margin-bottom: var(--space-xl); }
+h2 { font-size: var(--text-h2); font-weight: 600; margin-bottom: var(--space-sm); }
+h3 { font-size: var(--text-h3); font-weight: 600; margin-bottom: var(--space-2xs); }
+.prose { max-width: var(--measure); }
+.prose p + p { margin-top: var(--space-md); }
+.prose a { color: var(--color-accent); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+
+/* asymmetric split: one wide example plus narrower points */
+.split {
+  display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-xl);
+}
+@media (min-width: 62rem) {
+  .split { grid-template-columns: minmax(0, 1.25fr) minmax(0, 0.75fr); gap: var(--space-2xl); }
+}
+.notes { display: grid; gap: var(--space-lg); }
+.note { border-top: var(--rule) solid var(--color-rule); padding-top: var(--space-sm); }
+.note p { color: var(--color-ink-2); font-size: var(--text-sm); margin-top: var(--space-2xs); }
+
+/* F3 tabular spec sheet */
+.tablewrap { overflow-x: auto; border-top: var(--rule) solid var(--color-rule-2); }
+table { width: 100%; border-collapse: collapse; font-size: var(--text-sm);
+  font-variant-numeric: tabular-nums; }
+th, td { text-align: left; padding: var(--space-sm) var(--space-md) var(--space-sm) 0;
+  border-bottom: var(--rule) solid var(--color-rule); vertical-align: top; }
+th { font-family: var(--font-mono); font-size: var(--text-mono-label); font-weight: 500;
+  text-transform: uppercase; letter-spacing: 0.08em; color: var(--color-ink-3); white-space: nowrap; }
+td:first-child { color: var(--color-ink); }
+td code { font-size: 0.82rem; color: var(--color-ink); background: var(--color-paper-2);
+  border: var(--rule) solid var(--color-rule); border-radius: 4px; padding: 1px 5px; white-space: nowrap; }
+.v { font-family: var(--font-mono); font-size: var(--text-xs); font-weight: 500;
+  letter-spacing: 0.06em; white-space: nowrap; }
+.v--broken { color: var(--color-accent); }
+.v--dead   { color: var(--color-warn); }
+.v--ok     { color: var(--color-ink-3); }
+
+/* the one dark graphite band */
+.band {
+  background: var(--color-graphite-2); color: var(--color-on-graphite);
+  padding-block: var(--space-3xl); margin-block: var(--space-2xl);
+}
+.band h2, .band h3 { color: var(--color-on-graphite); }
+.band .mono-label { color: var(--color-on-graphite-2); }
+.band p { color: var(--color-on-graphite-2); }
+.band .prose a { color: var(--color-accent-dark); }
+.figs { display: grid; grid-template-columns: minmax(0, 1fr); gap: var(--space-xl);
+  margin-top: var(--space-2xl); }
+@media (min-width: 48rem) { .figs { grid-template-columns: repeat(3, minmax(0, 1fr)); } }
+.fig { border-top: var(--rule) solid var(--color-graphite-rule); padding-top: var(--space-sm); }
+.fig__n {
+  font-family: var(--font-display); font-size: clamp(1.9rem, 3.2vw, 2.5rem); font-weight: 600;
+  color: var(--color-accent-dark); letter-spacing: -0.03em; line-height: 1;
+  font-variant-numeric: tabular-nums;
+}
+.fig p { font-size: var(--text-sm); margin-top: var(--space-xs); }
+
+/* limits */
+.limits { display: grid; gap: 0; max-width: var(--measure); }
+.limits > div { border-bottom: var(--rule) solid var(--color-rule); padding-block: var(--space-md); }
+.limits > div:first-child { border-top: var(--rule) solid var(--color-rule); }
+
+/* Ft2 · inline single line */
+.foot { border-top: var(--rule) solid var(--color-rule); padding-block: var(--space-xl); }
+.foot__in { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-sm) var(--space-md);
+  font-size: var(--text-sm); color: var(--color-ink-3); }
+.foot a { color: var(--color-ink-2); text-decoration: none; white-space: nowrap;
+  border-bottom: var(--rule) solid var(--color-rule-2); padding-bottom: 1px; }
+.foot a:hover { color: var(--color-accent); border-color: var(--color-accent); }
+.foot__sep { color: var(--color-rule-2); }
+
+/* ⌘K palette */
+.pal[hidden] { display: none; }
+.pal {
+  position: fixed; inset: 0; z-index: var(--z-overlay);
+  display: grid; place-items: start center; padding: clamp(1rem, 10vh, 7rem) 1rem 1rem;
+  background: oklch(24% 0.02 258 / 0.35);
+}
+.pal__box {
+  width: 100%; max-width: 540px; background: var(--color-paper);
+  border: var(--rule) solid var(--color-rule-2); border-radius: var(--radius-md);
+  box-shadow: 0 12px 32px oklch(24% 0.02 258 / 0.14); overflow: hidden;
+}
+.pal__input {
+  width: 100%; border: 0; border-bottom: var(--rule) solid var(--color-rule);
+  padding: var(--space-md); font-family: var(--font-mono); font-size: var(--text-sm);
+  color: var(--color-ink); background: transparent;
+}
+.pal__input:focus { outline: none; }
+.pal__list { list-style: none; margin: 0; padding: var(--space-2xs); max-height: 44vh; overflow-y: auto; }
+.pal__list a {
+  display: flex; justify-content: space-between; gap: var(--space-md); align-items: center;
+  min-height: 40px; padding: var(--space-xs) var(--space-sm); border-radius: var(--radius-sm);
+  text-decoration: none; color: var(--color-ink-2); font-size: var(--text-sm);
+}
+.pal__list li[data-sel] a { background: var(--color-accent-wash); color: var(--color-accent); }
+.pal__hint { font-family: var(--font-mono); font-size: var(--text-xs); color: var(--color-ink-3); }
+.pal__empty { padding: var(--space-md); font-size: var(--text-sm); color: var(--color-ink-3); }
+.pal__foot { border-top: var(--rule) solid var(--color-rule); padding: var(--space-xs) var(--space-sm);
+  display: flex; gap: var(--space-md); }
+.skip {
+  position: absolute; left: -9999px; top: 0;
+  background: var(--color-accent); color: var(--color-accent-ink);
+  padding: var(--space-xs) var(--space-sm); border-radius: var(--radius-sm); z-index: 300;
+}
+.skip:focus { left: var(--space-sm); top: var(--space-sm); }
+</style>
+</head>
+<body>
+<a class="skip" href="#main">Skip to content</a>
+
+<nav class="nav">
+  <div class="wrap nav__in">
+    <a class="nav__mark" href="#top">sightline</a>
+    <div class="nav__links">
+      <a href="#install">Install</a>
+      <a href="#configure">Configure</a>
+      <a href="#report">Report</a>
+      <a href="#model">Model</a>
+      <a href="#speed">Speed</a>
+    </div>
+    <span class="nav__spacer"></span>
+    <button class="kbtn" id="palOpen" aria-haspopup="dialog">
+      Search<span class="kbtn__hint"><kbd>⌘</kbd><kbd>K</kbd></span>
+    </button>
+    <a class="btn btn--primary" href="https://github.com/uhsear/sightline">GitHub</a>
+  </div>
+</nav>
+
+<main id="main">
+
+<header class="hero wrap" id="top">
+  <div class="hero__grid">
+    <div class="reveal">
+      <h1>See what your audience actually sees.</h1>
+      <p class="hero__lede">A single-file Python tool that reads every web map in an ArcGIS Online organisation and finds the layers their viewers cannot load.</p>
+      <p class="hero__q">For every layer reference it answers one question: is every viewer of the <strong>map</strong> also a viewer of the <strong>layer</strong>?</p>
+      <div class="hero__cta">
+        <a class="btn btn--primary" href="#install">Install</a>
+        <a class="btn btn--ghost" href="#model">How it decides</a>
+      </div>
+      <p class="hero__meta mono-label">Python 3.9+ · arcgis · pandas · openpyxl · MIT</p>
+    </div>
+
+    <div class="reveal">
+      <div class="code">
+        <div class="code__bar">
+          <span class="code__name">terminal</span>
+          <span class="chip">336 maps · 161 s</span>
+        </div>
+<pre><code><span class="c-dim">$</span> python sightline.py
+
+<span class="c-dim">Connected to</span> &lt;your organisation&gt; <span class="c-dim">as</span> &lt;you&gt;
+<span class="c-dim">Scanning 336 web maps...</span>
+  <span class="c-dim">336/336 maps  62s elapsed  ~0s left</span>
+3583 layer refs, 546 distinct layer items
+
+642 findings of 3583 layer refs in 161s
+  <span class="c-dim">OK       2941</span>
+  <span class="c-dim">UNKNOWN   363</span>
+  <span class="c-key">BROKEN    142</span>
+  <span class="c-warn">DEAD      137</span>
+
+<span class="c-dim">→ ~/Downloads/sightline_20260721_150412.xlsx</span></code></pre>
+      </div>
+    </div>
+  </div>
+</header>
+
+<section class="sec wrap rule-top" id="what">
+  <div class="split">
+    <div class="reveal">
+      <h2>A public map with an org-only layer shows the public an empty canvas.</h2>
+      <div class="prose">
+        <p>Nobody gets told. The map still opens, the legend still lists the layer, and the tiles never arrive. The owner sees it working, because the owner can see the layer.</p>
+        <p>Sharing drifts one item at a time. A layer moves to a group, a service is republished under a new name, an item is deleted while three maps still point at it. Each change is invisible from the map that depends on it.</p>
+        <p>sightline reads the whole organisation and reports every one of those, ranked by how many people are looking.</p>
+      </div>
+    </div>
+    <div class="notes reveal">
+      <div class="note">
+        <h3>Read-only</h3>
+        <p>It changes nothing in your organisation. No writes, no re-sharing, no item edits.</p>
+      </div>
+      <div class="note">
+        <h3>Run it as an administrator</h3>
+        <p>A standard user only sees their own content, so the audit silently covers a fraction of the org and everything else reads as clean.</p>
+      </div>
+      <div class="note">
+        <h3>One file</h3>
+        <p><code>sightline.py</code>. No package, no framework, and no dependency beyond the three ArcGIS Pro already ships.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="sec wrap rule-top" id="install">
+  <div class="sec__head reveal">
+    <h2>Install</h2>
+    <p>ArcGIS Pro ships <code>arcgis</code>, <code>pandas</code> and <code>openpyxl</code>, so you can use its interpreter and install nothing.</p>
+  </div>
+  <div class="split">
+    <div class="reveal">
+      <div class="code">
+        <div class="code__bar"><span class="code__name">powershell / arcgis pro</span></div>
+<pre><code><span class="c-dim">&amp;</span> <span class="c-key">"C:\Program Files\ArcGIS\Pro\bin\Python\envs\arcgispro-py3\python.exe"</span> `
+    sightline.py --self-check
+
+<span class="c-dim">self-check passed</span></code></pre>
+      </div>
+      <div style="height: var(--space-md)"></div>
+      <div class="code">
+        <div class="code__bar"><span class="code__name">bash / anywhere else</span></div>
+<pre><code><span class="c-dim">$</span> pip install arcgis pandas openpyxl
+<span class="c-dim">$</span> python sightline.py --self-check
+
+<span class="c-dim">self-check passed</span></code></pre>
+      </div>
+    </div>
+    <div class="notes reveal">
+      <div class="note">
+        <h3>Verify before you trust it</h3>
+        <p><code>--self-check</code> runs the full assertion suite with no network and no credentials. It asserts the classification matrix, so a regression fails loudly instead of quietly under-reporting.</p>
+      </div>
+      <div class="note">
+        <h3>Smoke-test first</h3>
+        <p><code>--limit 10</code> caps the scan while you confirm the connection and the output path.</p>
+      </div>
+      <div class="note">
+        <h3>Credentials</h3>
+        <p>Resolved in order: the config block, then <code>ARCGIS_USER</code> / <code>ARCGIS_PASS</code>, then a signed-in ArcGIS Pro session, then an interactive prompt. The script writes no password to disk.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="sec wrap rule-top" id="configure">
+  <div class="sec__head reveal">
+    <h2>Configure</h2>
+    <p>Everything tunable sits in one <code>CONFIG</code> block at the top of the file. Command-line flags override the matching value.</p>
+  </div>
+  <div class="tablewrap reveal">
+    <table>
+      <thead>
+        <tr><th scope="col">Setting</th><th scope="col">Default</th><th scope="col">What it does</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>PORTAL_URL</code></td><td><code>arcgis.com</code></td><td>Point at an Enterprise portal instead</td></tr>
+        <tr><td><code>USERNAME</code> / <code>PASSWORD</code></td><td>blank</td><td>Leave blank, prefer the environment or the prompt</td></tr>
+        <tr><td><code>MAX_MAPS</code></td><td><code>10000</code></td><td>Ceiling on web maps fetched</td></tr>
+        <tr><td><code>DEFAULT_LIMIT</code></td><td><code>None</code></td><td>Cap every run without passing <code>--limit</code></td></tr>
+        <tr><td><code>DEEP_DEFAULT</code></td><td><code>False</code></td><td>Always collect feature counts and last-edit dates</td></tr>
+        <tr><td><code>OUTPUT_DIR</code></td><td><code>~/Downloads</code></td><td>Where the report lands</td></tr>
+        <tr><td><code>PROBE_TIMEOUT</code></td><td><code>8</code></td><td>Seconds allowed per service URL</td></tr>
+        <tr><td><code>MAX_HOST_FAILS</code></td><td><code>3</code></td><td>Failures before a host is skipped entirely</td></tr>
+        <tr><td><code>SECURED_CODES</code></td><td><code>401 403 498 499</code></td><td>REST codes meaning “needs a token”</td></tr>
+        <tr><td><code>DEAD_CODES</code></td><td><code>400 404</code></td><td>REST codes meaning “not there”</td></tr>
+        <tr><td><code>ITEM_CHUNK</code></td><td><code>50</code></td><td>Item ids resolved per batched lookup</td></tr>
+        <tr><td><code>SEV</code></td><td>public → High</td><td>Severity band per map audience</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="prose reveal" style="margin-top: var(--space-lg)">
+    <p><strong>Do not put a real password in <code>PASSWORD</code>.</strong> A password typed into a script is a password you will eventually commit. The field exists for locked-down automation where environment variables are not available.</p>
+  </div>
+</section>
+
+<section class="sec wrap rule-top" id="report">
+  <div class="sec__head reveal">
+    <h2>Reading the report</h2>
+    <p>Three sheets. <strong>Findings</strong> is everything that is not OK, worst first. This is the work queue. <strong>AllLayers</strong> is every reference examined, including healthy ones, for pivoting. <strong>Summary</strong> carries run metadata, verdict totals, the worst maps, and the owners with the most problems. That last table is who you email.</p>
+  </div>
+  <div class="tablewrap reveal">
+    <table>
+      <thead>
+        <tr><th scope="col">Verdict</th><th scope="col">Meaning</th><th scope="col">Typical cause</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><span class="v v--ok">OK</span></td><td>Every map viewer can load the layer</td><td></td></tr>
+        <tr><td><span class="v v--broken">BROKEN</span></td><td>Some map viewers <strong>cannot</strong> load the layer</td><td>Public map with an org-only layer; a token-secured service in a public map</td></tr>
+        <tr><td><span class="v v--dead">DEAD</span></td><td>The item or service no longer exists</td><td>Item deleted; service removed or renamed</td></tr>
+        <tr><td><span class="v v--ok">UNKNOWN</span></td><td>Could not be determined</td><td>Unreachable host, or group membership unavailable. The <code>Reason</code> column says which</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="split" style="margin-top: var(--space-2xl)">
+    <div class="prose reveal">
+      <h3>Severity follows the map, not the layer</h3>
+      <p>A broken layer in a private map is a note to self. The same layer in a public map is on your website right now. Bands run <code>1 High</code> public, <code>2 Medium</code> org, <code>3 Low</code> shared, <code>4 Info</code> private. Findings sorts by severity then view count, so the most-visited broken public map is the first row you read.</p>
+    </div>
+    <div class="notes reveal">
+      <div class="note">
+        <h3>The Overexposed column</h3>
+        <p>A separate problem, deliberately kept out of Findings: a public layer inside a non-public map. Nothing is broken, but the data is shared more widely than its map implies. Only org-owned layers are flagged, so basemaps create no noise.</p>
+      </div>
+      <div class="note">
+        <h3>Errors are findings</h3>
+        <p>A map that fails to read becomes a row with its exception recorded, not a silent omission.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="sec wrap rule-top" id="model">
+  <div class="sec__head reveal">
+    <h2>How it decides</h2>
+    <p>Sharing is <strong>audience containment</strong>, not a severity rank. The common shortcut, <code>private &lt; org = shared &lt; public</code>, hides real breakage.</p>
+  </div>
+  <div class="prose reveal" style="margin-bottom: var(--space-xl)">
+    <p><code>org</code> and <code>shared</code> are <em>incomparable</em> audiences, not equal ones. An org member outside the group cannot load a group-shared layer, so an org-wide map with a group-shared layer is broken for most of its audience even though a rank comparison calls the two equivalent.</p>
+  </div>
+  <div class="tablewrap reveal">
+    <table>
+      <thead>
+        <tr><th scope="col">Layer</th><th scope="col">Map</th><th scope="col">Result</th><th scope="col">Why</th></tr>
+      </thead>
+      <tbody>
+        <tr><td><code>public</code></td><td>anything</td><td><span class="v v--ok">OK</span></td><td>Public contains every audience</td></tr>
+        <tr><td>anything</td><td><code>private</code></td><td><span class="v v--ok">OK</span></td><td>The audience is the owner alone</td></tr>
+        <tr><td><code>private</code> (other owner)</td><td><code>private</code></td><td><span class="v v--broken">BROKEN</span></td><td>Not even the map’s owner can load it</td></tr>
+        <tr><td><code>org</code></td><td><code>public</code></td><td><span class="v v--broken">BROKEN</span></td><td>Anonymous visitors are not org members</td></tr>
+        <tr><td><code>org</code></td><td><code>org</code> / <code>shared</code></td><td><span class="v v--ok">OK</span></td><td>Group members are org members</td></tr>
+        <tr><td><code>shared</code></td><td><code>org</code> / <code>public</code></td><td><span class="v v--broken">BROKEN</span></td><td>The audience is wider than the group</td></tr>
+        <tr><td><code>shared</code></td><td><code>shared</code></td><td>compare sets</td><td>Broken if the map reaches a group the layer does not</td></tr>
+        <tr><td><code>shared</code></td><td><code>shared</code>, groups unknown</td><td><span class="v v--ok">UNKNOWN</span></td><td>Never guessed</td></tr>
+      </tbody>
+    </table>
+  </div>
+  <div class="prose reveal" style="margin-top: var(--space-lg)">
+    <p>A map shared to <em>zero</em> groups normalises to <code>private</code>, since its real audience is the owner.</p>
+  </div>
+
+  <div class="split" style="margin-top: var(--space-2xl)">
+    <div class="prose reveal">
+      <h3>The layers that are not items at all</h3>
+      <p>In the organisation this was built against, <strong>57%</strong> of layer references are not ArcGIS Online items at all. They are registered service URLs, on-premises servers and basemaps. Tools that only compare item permissions mark every one of them fine.</p>
+      <p>sightline fetches each distinct service URL anonymously, with no token, and reads what the public would get. A service answering <code>499</code> inside a public map means every anonymous visitor gets an empty map. TLS verification stays on, because a certificate a browser would reject is a finding rather than something to suppress.</p>
+    </div>
+    <div class="reveal">
+      <div class="code">
+        <div class="code__bar"><span class="code__name">anonymous probe → verdict</span></div>
+<pre><code>responds normally      <span class="c-dim">→</span> the layer really is public
+<span class="c-key">401 403 498 499</span>        <span class="c-dim">→</span> needs a token
+                          <span class="c-dim">in a public map:</span> <span class="c-key">BROKEN</span>
+<span class="c-warn">400 404</span>                <span class="c-dim">→</span> <span class="c-warn">DEAD</span>, the service is gone
+connection failure     <span class="c-dim">→</span> <span class="c-dim">UNKNOWN</span>, reason recorded</code></pre>
+      </div>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<section class="band" id="speed">
+  <div class="wrap">
+    <div class="sec__head reveal" style="margin-bottom: var(--space-lg)">
+      <h2>Why it is fast</h2>
+    </div>
+    <div class="prose reveal">
+      <p>The naive version of this audit takes about <strong>19 minutes</strong> against a 336-map organisation. This one takes under three. Three things account for the difference, each measured.</p>
+    </div>
+    <div class="figs">
+      <div class="fig reveal">
+        <div class="fig__n">0.665 s</div>
+        <p><strong>Never touch an unknown attribute on an Item.</strong> <code>Item.__getattr__</code> performs a network round trip <em>before</em> raising <code>AttributeError</code>. One <code>hasattr()</code> call costs this much. The tool sightline replaced called it twice per layer to fill two columns that were empty in 171 of 171 rows, spending roughly 95% of its runtime in dead code.</p>
+      </div>
+      <div class="fig reveal">
+        <div class="fig__n">18.8x</div>
+        <p><strong>Resolve items in batches.</strong> One <code>id:(a OR b OR ...)</code> search resolves 50 ids per round trip instead of one, measured 18.8 times faster than calling <code>content.get()</code> per id with byte-identical results.</p>
+      </div>
+      <div class="fig reveal">
+        <div class="fig__n">0.7x</div>
+        <p><strong>Do not reach for threads.</strong> On a shared <code>GIS</code> session, 4 workers gave 1.3x, 8 gave 1.1x and 16 gave 0.7x, slower than sequential. The connection serialises, so the script stays sequential and readable.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="sec--tight wrap" id="limits">
+  <div class="sec__head reveal">
+    <h2>What it does not do</h2>
+  </div>
+  <div class="limits reveal">
+    <div>
+      <h3>Web maps only</h3>
+      <p>Dashboards, Experience Builder apps, StoryMaps and Web Mapping Applications are not scanned. In a typical organisation those outnumber web maps roughly two to one, so this is a real gap.</p>
+    </div>
+    <div>
+      <h3>Group membership is item-level</h3>
+      <p>It compares which groups a map and a layer are shared to. It does not enumerate group members, so it cannot tell you a group is empty.</p>
+    </div>
+    <div>
+      <h3>UNKNOWN is honest, not lazy</h3>
+      <p>An unreachable host may be a firewall rule rather than a defect. Check the <code>Reason</code> column before acting.</p>
+    </div>
+    <div>
+      <h3>A secured service in a non-public map stays UNKNOWN</h3>
+      <p>Whether your org members hold credentials for an on-premises service cannot be determined from ArcGIS Online.</p>
+    </div>
+  </div>
+</section>
+
+<footer class="foot">
+  <div class="wrap foot__in">
+    <span><strong style="color: var(--color-ink); font-family: var(--font-display); letter-spacing: -0.02em;">sightline</strong></span>
+    <span class="foot__sep">·</span>
+    <span>Audit what your maps actually show.</span>
+    <span class="nav__spacer"></span>
+    <a href="https://github.com/uhsear/sightline">Source</a>
+    <span class="foot__sep">·</span>
+    <a href="https://github.com/uhsear/sightline/issues">Report an issue</a>
+    <span class="foot__sep">·</span>
+    <a href="https://www.linkedin.com/in/asir-khan-310317264/" rel="noopener">Asir Khan</a>
+    <span class="foot__sep">·</span>
+    <a href="https://github.com/uhsear/sightline/blob/main/LICENSE">MIT</a>
+  </div>
+</footer>
+
+<div class="pal" id="pal" hidden role="dialog" aria-modal="true" aria-label="Search the documentation">
+  <div class="pal__box" role="document">
+    <input class="pal__input" id="palInput" type="text" placeholder="Search documentation" autocomplete="off" aria-controls="palList" />
+    <ul class="pal__list" id="palList" role="listbox" aria-label="Results"></ul>
+    <div class="pal__foot">
+      <span class="pal__hint"><kbd>↑</kbd><kbd>↓</kbd> navigate</span>
+      <span class="pal__hint"><kbd>↵</kbd> open</span>
+      <span class="pal__hint"><kbd>esc</kbd> close</span>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  /* reveal: one entrance, then the page is just there */
+  var reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  var nodes = document.querySelectorAll(".reveal");
+  if (reduced || !("IntersectionObserver" in window)) {
+    nodes.forEach(function (n) { n.classList.add("is-in"); });
+  } else {
+    var io = new IntersectionObserver(function (entries) {
+      entries.forEach(function (e) {
+        if (e.isIntersecting) { e.target.classList.add("is-in"); io.unobserve(e.target); }
+      });
+    }, { rootMargin: "0px 0px -8% 0px", threshold: 0.06 });
+    nodes.forEach(function (n) { io.observe(n); });
+  }
+
+  /* ⌘K palette */
+  var ITEMS = [
+    { t: "Install",                 h: "#install",   k: "install pip arcgis pro python self-check" },
+    { t: "Configure",               h: "#configure", k: "config settings portal password timeout chunk" },
+    { t: "Reading the report",      h: "#report",    k: "report excel findings alllayers summary verdict severity" },
+    { t: "How it decides",          h: "#model",     k: "model classification containment broken dead unknown probe" },
+    { t: "Why it is fast",          h: "#speed",     k: "fast speed batch threads hasattr performance" },
+    { t: "What it does not do",     h: "#limits",    k: "limits limitations gaps dashboards groups" },
+    { t: "Source on GitHub",        h: "https://github.com/uhsear/sightline", k: "github source repo code" }
+  ];
+
+  var pal = document.getElementById("pal"),
+      box = pal.querySelector(".pal__box"),
+      input = document.getElementById("palInput"),
+      list = document.getElementById("palList"),
+      openBtn = document.getElementById("palOpen"),
+      sel = 0, shown = [], lastFocus = null;
+
+  function render(q) {
+    q = (q || "").trim().toLowerCase();
+    shown = ITEMS.filter(function (i) {
+      return !q || i.t.toLowerCase().indexOf(q) > -1 || i.k.indexOf(q) > -1;
+    });
+    sel = 0;
+    if (!shown.length) {
+      list.innerHTML = '<li class="pal__empty">No matches.</li>';
+      return;
+    }
+    list.innerHTML = shown.map(function (i, n) {
+      var ext = i.h.charAt(0) !== "#";
+      return '<li role="option"' + (n === 0 ? ' data-sel aria-selected="true"' : ' aria-selected="false"') + '>' +
+             '<a href="' + i.h + '"' + (ext ? ' rel="noopener"' : "") + '>' +
+             '<span>' + i.t + '</span>' +
+             '<span class="pal__hint">' + (ext ? "↗" : "↵") + "</span></a></li>";
+    }).join("");
+  }
+
+  function mark() {
+    Array.prototype.forEach.call(list.children, function (li, n) {
+      if (n === sel) { li.setAttribute("data-sel", ""); li.setAttribute("aria-selected", "true"); }
+      else { li.removeAttribute("data-sel"); li.setAttribute("aria-selected", "false"); }
+    });
+    var cur = list.children[sel];
+    if (cur && cur.scrollIntoView) cur.scrollIntoView({ block: "nearest" });
+  }
+
+  function open() {
+    lastFocus = document.activeElement;
+    pal.hidden = false;
+    input.value = "";
+    render("");
+    input.focus();
+  }
+
+  function close() {
+    pal.hidden = true;
+    if (lastFocus && lastFocus.focus) lastFocus.focus();
+  }
+
+  openBtn.addEventListener("click", open);
+  input.addEventListener("input", function () { render(input.value); });
+
+  pal.addEventListener("mousedown", function (e) { if (!box.contains(e.target)) close(); });
+
+  document.addEventListener("keydown", function (e) {
+    var k = e.key.toLowerCase();
+    if ((e.metaKey || e.ctrlKey) && k === "k") { e.preventDefault(); pal.hidden ? open() : close(); return; }
+    if (pal.hidden) return;
+    if (e.key === "Escape") { e.preventDefault(); close(); return; }
+    if (!shown.length) return;
+    if (e.key === "ArrowDown") { e.preventDefault(); sel = (sel + 1) % shown.length; mark(); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); sel = (sel - 1 + shown.length) % shown.length; mark(); }
+    else if (e.key === "Enter") {
+      e.preventDefault();
+      var a = list.children[sel] && list.children[sel].querySelector("a");
+      if (a) { close(); a.click(); }
+    }
+    else if (e.key === "Tab") {
+      /* keep focus inside the dialog */
+      e.preventDefault();
+      input.focus();
+    }
+  });
+})();
+</script>
+</body>
+</html>

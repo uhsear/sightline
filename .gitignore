@@ -1,0 +1,33 @@
+# Audit output. Reports contain real org structure, usernames, item ids and
+# internal service URLs, so never commit one to a public repository.
+*.xlsx
+*.xls
+*.csv
+oracle_out.json
+reports/
+
+# The script this tool replaced. Internal work product, not ours to publish.
+AGOL Audit script*.txt
+
+# Credentials
+.env
+*.env
+credentials*
+*token*
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local tooling artifacts
+.playwright-mcp/
