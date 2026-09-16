@@ -204,3 +204,9 @@ Built by [Asir Khan](https://www.linkedin.com/in/asir-khan-310317264/).
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Related
+
+Other single-file tools in this portfolio that pair with this one:
+
+- [sharewatch](https://github.com/uhsear/sharewatch) - the same platform from the other side: what CHANGED last night, rather than what a viewer sees today
