@@ -210,3 +210,5 @@ MIT. See [LICENSE](LICENSE).
 Other single-file tools in this portfolio that pair with this one:
 
 - [sharewatch](https://github.com/uhsear/sharewatch) - the same platform from the other side: what CHANGED last night, rather than what a viewer sees today
+- [ghostsvc](https://github.com/uhsear/ghostsvc) - the anonymous services a viewer-side audit never reaches
+- [whobreaks](https://github.com/uhsear/whobreaks) - what breaks if you delete one of the items it flags
