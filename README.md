@@ -133,6 +133,10 @@ so an org-wide map with a group-shared layer is broken for most of its audience.
 
 A map shared to zero groups normalizes to `private`, since its real audience is the owner.
 
+Group sets are compared by group id, never by title. Two groups can have the same title, for
+example two "GIS Staff" groups made by different owners. A comparison by title would call
+them the same audience. Titles appear in the report only as labels.
+
 ### Layers that are not items
 
 In the org this was built against, 57% of layer references are not ArcGIS Online items at
