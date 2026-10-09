@@ -23,6 +23,8 @@ import time
 import getpass
 import argparse
 import datetime
+import contextlib
+import io
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -661,13 +663,24 @@ def self_check():
     # 18. a DEAD reason must carry the real code, not a hardcoded 404
     assert "400" in verdict("DEAD", "code 400", None, None, None, "public", None, U)[1]
 
+    # 19. a unique prefix of the longest option must be refused, not expanded  <-- pinned defect
+    try:
+        with contextlib.redirect_stderr(io.StringIO()):
+            build_parser().parse_args(["--self-ch"])
+    except SystemExit:
+        pass
+    else:
+        raise AssertionError("parser expanded the unique prefix --self-ch")
+
     print("self-check passed")
 
 
 # --------------------------------------------------------------------------- main
 
-def main():
-    p = argparse.ArgumentParser(description="Audit AGOL web maps for layers their viewers cannot see.")
+def build_parser():
+    # allow_abbrev=False: a prefix such as --self-ch must not silently expand to a flag
+    p = argparse.ArgumentParser(description="Audit AGOL web maps for layers their viewers cannot see.",
+                                allow_abbrev=False)
     default = os.path.join(OUTPUT_DIR, "%s_%s.xlsx"
                            % (OUTPUT_PREFIX, datetime.datetime.now().strftime("%Y%m%d_%H%M%S")))
     p.add_argument("-o", "--out", default=default, help="output .xlsx (default: %(default)s)")
@@ -676,7 +689,11 @@ def main():
     p.add_argument("--deep", action="store_true", default=DEEP_DEFAULT,
                    help="add FeatureCount + LastEditUTC (~30s)")
     p.add_argument("--self-check", action="store_true", help="run asserts, no network, and exit")
-    a = p.parse_args()
+    return p
+
+
+def main():
+    a = build_parser().parse_args()
     if a.self_check:
         self_check()
         return 0
