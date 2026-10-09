@@ -61,8 +61,8 @@ covers a fraction of the org and everything else reads as clean.
 
 **Scheduled tasks need a Python without ArcPy.** sightline imports the `arcgis` package at
 startup. That package probes for ArcPy when it loads. Under a non-interactive scheduled task,
-the ArcGIS Pro licence may not be initialised. The import then fails before sightline reaches
-your portal. The ArcGIS Pro Python above has ArcPy, so it has this problem. For a scheduled
+the ArcGIS Pro licence may not be initialised. The import then fails with "The Product
+License has not been initialized", before sightline reaches your portal. The ArcGIS Pro Python above has ArcPy, so it has this problem. For a scheduled
 run, use a Python that has `arcgis` installed but not `arcpy`. Set `ARCGIS_USER` and
 `ARCGIS_PASS` for that run too. Without ArcPy there is no Pro session to sign in with, and a
 task cannot answer a prompt.
