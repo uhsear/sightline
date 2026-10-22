@@ -17,6 +17,8 @@ credentials*
 
 # Python
 __pycache__/
+.coverage
+htmlcov/
 *.py[cod]
 *.egg-info/
 .venv/
