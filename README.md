@@ -24,8 +24,8 @@ With `--edges`, it asks the same question one level up:
 
 With `--wcag`, it also runs six accessibility rules over the same web maps.
 
-This is a real run of the real `main()`. It used the synthetic portal that the self-test builds,
-served from a local stub, so no portal and no login were involved:
+This is a run of `main()` against the synthetic portal that the self-test builds. The portal
+object is a fake and the services are a local stub, so no portal and no login were involved:
 
 ```
 Connected to Test Org as admin
@@ -100,8 +100,9 @@ python sightline.py --self-test
 ```
 
 `--self-test` runs the assertion suite with no portal and no credentials. It starts a small
-web server on 127.0.0.1 and talks to that. If the last line reads `0 failed`, the install is
-good. `--self-check` is the old name for the same flag and still works.
+web server on 127.0.0.1 and talks to that. If the last line reads `0 failed` and no `SKIP` line
+sits above it, the install is good. A `SKIP` line means pandas or openpyxl is missing, so the
+Excel report was not tested. `--self-check` is the old name for the same flag and still works.
 
 ## Use
 
@@ -130,11 +131,20 @@ with exit code 2 instead of being read as `--apply`, and `--self-ch` is refused 
 being read as `--self-check`.
 
 sightline is read-only toward your organization. The one thing it writes is the report. A new
-report path needs no flag. An existing file is never replaced without `--apply`, and the check
-runs before the audit starts, so a long run cannot end in a refusal.
+report path needs no flag. An existing file is never replaced without `--apply`. The check for
+an existing file, and the check that the output folder exists, run before the audit starts, so
+a long run cannot end in a refusal.
 
-Exit codes: `0` for a finished run or a green self-test, `1` for a red self-test, `2` for a
-refused flag or an output file that exists.
+Exit codes:
+
+| Code | Meaning |
+|---|---|
+| `0` | A complete run, or a green self-test. Findings do not change the code. |
+| `1` | A red self-test, or a missing library. |
+| `2` | A refused flag, an output file that exists, or an output folder that does not. |
+| `3` | The report was written, but the run is incomplete: no web maps were found, or a web map or app could not be read. The console prints `INCOMPLETE`. |
+
+A scheduled task can test for `3` to tell a run that audited nothing from a clean one.
 
 Credentials resolve as a pair, and none of them is a file sightline writes. Username comes
 from `USERNAME` in the config block, or `ARCGIS_USER` if that is blank; password from
@@ -236,7 +246,7 @@ and the reason. Severity follows the map's audience.
 |---|---|
 | `OK` | Every map viewer can load the layer |
 | `BROKEN` | Some map viewers cannot load the layer |
-| `DEAD` | The layer's item or service no longer exists |
+| `DEAD` | The layer's service is gone, or its item was not found by the signed-in account. The item may be deleted, or the account may not be able to see it. The `Reason` column says which |
 | `UNKNOWN` | Could not be determined. The `Reason` column says why |
 
 Severity follows the map's audience, because that is who is affected:
@@ -259,12 +269,21 @@ so an org-wide map with a group-shared layer is broken for most of its audience.
 | anything | `private` | OK |
 | `private` owned by someone else | `private` | BROKEN |
 | `org` | `public` | BROKEN |
-| `org` | `org` or `shared` | OK |
+| `org` | `org` | OK |
+| `org` | `shared` | UNKNOWN |
 | `shared` | `org` or `public` | BROKEN |
 | `shared` | `shared` | Compare group sets |
 | `shared` | `shared`, groups unknown | UNKNOWN |
 
-A map shared to zero groups normalizes to `private`, since its real audience is the owner.
+An item shared to zero groups normalizes to `private`, since its real audience is the owner.
+This holds for the map and for the layer. A layer shared to no group, owned by someone else,
+is therefore BROKEN in a private map.
+
+An `org` layer in a group-shared map is `UNKNOWN`, not OK. Esri lets a group take members from
+other organizations ([Share items](https://doc.arcgis.com/en/arcgis-online/share-maps/share-items.htm)),
+and those members cannot load an org-only item. I took this from an audit
+note and could not re-open the page when I wrote it, so check the page. sightline does not read group members, so it
+cannot say that every member belongs to your organization.
 
 Group sets are compared by group id, never by title. Two groups can have the same title, for
 example two "GIS Staff" groups made by different owners. A comparison by title would call
@@ -284,10 +303,18 @@ public would get:
 | Normal | The layer really is public |
 | `401` `403` `498` `499` | Needs a token. In a public map this is BROKEN |
 | `400` `404` | The service is gone |
+| A 200 reply whose `error` is not an object with a code | UNKNOWN, reason `error reply of unknown shape` |
 | Connection failure | UNKNOWN, with the reason recorded |
 
 This catches a map titled "Internal" that is shared publicly and points at token-secured
 services. No data leaks, but the map is broken for every visitor.
+
+The probe sends the layer's own query string, because a layer built from a `.../query?where=...`
+url needs it. It replaces any `f=` parameter with `f=json`. It drops every parameter whose name
+contains `token`, `key`, `pass`, `pwd`, `secret`, `sig`, `auth` or `credential`, and it drops
+any `user:password@` part, so the probe sends no credential. The report shows the same cleaned
+url in the `LayerUrl` column, in its hyperlink and in the `WCAG` sheet. The name test is a
+heuristic. A secret in a parameter with another name is still copied.
 
 TLS verification stays on. A certificate a browser would reject is a finding, not something
 to suppress.
@@ -305,12 +332,13 @@ The app is treated as the "map" in the table above, and the embedded web map is 
 | Web map is | App `public` | App `org` | App `shared` | App `private` |
 |---|---|---|---|---|
 | `public` | OK | OK | OK | OK |
-| `org` | BROKEN | OK | OK | OK |
+| `org` | BROKEN | OK | UNKNOWN | OK |
 | `shared` | BROKEN | BROKEN | Compare group sets | OK |
 | `private` | BROKEN | BROKEN | BROKEN | OK if the owner is the same |
 
-The same two rules apply as for layers. An app shared to zero groups is `private`. Unknown
-group membership on either side is `UNKNOWN`, never a silent OK.
+The same rules apply as for layers. An item shared to zero groups is `private`, on either
+side. Unknown group membership on either side is `UNKNOWN`, never a silent OK. An `org` web map
+under a group-shared app is `UNKNOWN`, for the reason given in the layer table.
 
 **How an embedded map is found.** Esri documents the data of these item types only in part:
 the item-type page above lists no JSON shape for any of the four. Esri's
@@ -378,9 +406,10 @@ What the rules choose not to do:
 
 ## Why it is fast
 
-The naive version of this audit takes about 19 minutes against an organization of a few
-hundred web maps. This one takes under three. Three things account for the difference, each
-measured:
+The naive version of this audit took about 19 minutes against an organization of a few
+hundred web maps. This one takes under three. I measured the numbers below against a live
+organization while building the tool. The self-test cannot reproduce them, because it has no
+portal. Three things account for the difference:
 
 **Never touch an unknown attribute on an `Item`.** `Item.__getattr__` performs a network
 round trip before raising `AttributeError`. One `hasattr()` call costs 0.665 seconds. The
@@ -394,6 +423,10 @@ instead of one, measured 18.8 times faster with byte-identical results.
 and 16 gave 0.7x, slower than sequential. The connection serialises, so sightline stays
 sequential and readable.
 
+The self-test pins the rule and the batch size, not the times. Its fake `Item` raises an
+`AssertionError` on any attribute that is not `id`, `get_data` or a dict key, so a full run
+fails if the code ever probes one. A chunk test checks that ids go out 50 at a time.
+
 `--wcag` adds no request. It reads the JSON that the layer audit already fetched. `--edges`
 adds one search per item type, and one read per app.
 
@@ -405,7 +438,14 @@ sightline self-test: 127.0.0.1 stub and temporary files only, no portal, no logi
 --------------------------------------------------------------------
 PASS  check() and raises() really do record a failure  <-- pinned defect
 ...
+PASS  an org-only layer in a group-shared map is unknown, since a group can hold outside members  <-- pinned defect
+...
+PASS  a layer shared to no group is invisible to a private map owned by someone else  <-- pinned defect
+...
 PASS  a token already in the layer url is not sent  <-- pinned defect
+PASS  a layer url keeps its own query, with f=json swapped in and the token dropped  <-- pinned defect
+...
+PASS  a 200 whose error is a list is unknown, not a crash  <-- pinned defect
 ...
 PASS  a failed lookup chunk is unresolved, never reported as deleted  <-- pinned defect
 ...
@@ -413,9 +453,7 @@ PASS  collect() prints its final progress line even when the last map fails  <--
 ...
 PASS  a public app on an org map is broken
 ...
-PASS  an app shared to no group is owner-only even when the map's groups are unknown  <-- pinned defect
-...
-PASS  app public on a org map is BROKEN
+PASS  a group app on an org map is unknown: a group can hold members from another organisation  <-- pinned defect
 ...
 PASS  an app shared to a group the map lacks names the group
 ...
@@ -425,21 +463,26 @@ PASS  two marker classes that differ only by color are flagged
 ...
 PASS  label text under 4.5:1 on its halo is flagged
 ...
+PASS  black text on a black halo is flagged, on a white halo it is fine  <-- pinned defect
+...
 PASS  a prefix of the write flag, --ap, is refused  <-- pinned defect
 ...
 PASS  main returns the exit status of --self-test, so a red self-test fails CI  <-- pinned defect
 ...
-PASS  a column that no row filled is blank, with no pandas deprecation warning  <-- pinned defect
-...
 PASS  an existing report is not replaced without --apply  <-- pinned defect
 ...
 PASS  --limit 0 means zero, and an empty audit still writes its report  <-- pinned defect
+PASS  no token or password from a layer url reaches the cells, the links, or the console  <-- pinned defect
+PASS  the groups of a map that is embedded but not scanned are still read  <-- pinned defect
+PASS  no web maps: the report is written and the exit code is 3, not 0  <-- pinned defect
+...
+PASS  an output folder that does not exist is refused before the audit starts  <-- pinned defect
 ...
 --------------------------------------------------------------------
-273 assertions, 0 failed
+306 assertions, 0 failed
 ```
 
-The full run prints all 273 assertions. Each `...` line is where this block is cut.
+The full run prints all 306 assertions. Each `...` line is where this block is cut.
 Lines marked `<-- pinned defect` are cases where a real defect was found, or could return, and
 the assertion keeps it from coming back.
 
@@ -447,16 +490,20 @@ The count is the same on every host that has `pandas` and `openpyxl`:
 
 | Host | Python | Count |
 |---|---|---|
-| Windows, ArcGIS Pro conda environment (has `arcgis`, `arcpy`) | 3.13.7 | 273 |
-| Windows | 3.13.2 | 273 |
-| Windows, virtual environment | 3.9.25, pandas 2.3.3 | 273 |
-| Linux, virtual environment | 3.12.3, pandas 3.1.0 | 273 |
+| Windows, ArcGIS Pro conda environment (has `arcgis`, `arcpy`, pandas, openpyxl) | 3.13.7 | 306 |
+| Windows, virtual environment | 3.9.25, pandas 2.3.3, openpyxl 3.1.5 | 306 |
+| Linux, virtual environment | 3.12.3, pandas 3.1.0 | 306 |
+| Windows, plain `C:\Python313`, no pandas | 3.13.2 | 273 |
+| Linux, system `python3`, no pandas | 3.12.3 | 273 |
 
 The self-test never imports `arcgis` or `arcpy`, so they change nothing. On a Python without
-`pandas` or `openpyxl`, the Excel assertions print `SKIP  report writer` and the count drops to
-247. The run still ends `0 failed`, and the skip line says what did not run.
+`pandas` or `openpyxl`, 33 Excel assertions do not run. The run prints `SKIP  report writer`
+where they would be, and a second `SKIP` line above the footer. The count drops to 273. The
+run still ends `0 failed`, so read the `SKIP` line before you trust the footer. The two hosts
+without pandas give the same count, 273, and the three with pandas give 306.
 
-`coverage run --branch sightline.py --self-test` reports 100 percent of the 1357 statements and 326 branches on the Windows ArcGIS Pro environment and on the Linux virtual environment. Without `openpyxl` the Excel assertions skip, and the same command reports 85 percent.
+`coverage run --branch sightline.py --self-check` reports 100 percent of 1466 statements and
+344 branches on the Windows ArcGIS Pro environment and on the Linux virtual environment.
 
 ## Limits
 
@@ -487,6 +534,72 @@ The self-test never imports `arcgis` or `arcpy`, so they change nothing. On a Py
   versions did the same. It shows as `UNKNOWN`.
 - **The `--wcag` description check strips tags with a pattern, not a parser.** A description
   made only of entities such as `&nbsp;` counts as text.
+- **The probe fetches any url a web map holds.** A layer url whose scheme is not http or https
+  goes to `urlopen` as given, redirects are followed, and private-network addresses are
+  fetched too. A hostile web map can make the machine that runs sightline request an
+  arbitrary url. Only a status is kept. Run it from a host whose network reach you accept.
+- **The probe reads any JSON object with no `error` key as PUBLIC.** That includes a reply
+  from a service that is not an ArcGIS service.
+- **A string error code is UNKNOWN.** A reply such as `{"error": {"code": "498"}}` is not
+  classed SECURED, because the code table holds integers only.
+- **Malformed layer urls trip the host circuit breaker.** Three urls with a space, a control
+  character or a non-ASCII character fail as transport errors. Later good urls on the same
+  host then read `UNREACHABLE` instead of being probed.
+- **A layer `itemId`, `url` or title that is not a string stops the run.** A number or an
+  object there raises a `TypeError` or an `AttributeError` before any report is written.
+- **An upper-case layer `itemId` reads as DEAD.** It is looked up as given, and the search
+  returns lower-case ids, so a live layer shows as a false DEAD.
+- **`Overexposed` only fires for org-owned layer items.** A public service found by the
+  probe, or a public item from another organization, is never marked, which is narrower than
+  "a public layer inside a non-public map".
+- **Run as a non-admin, some apps get no edge row.** An app whose web map is private to
+  someone else, or deleted, is missing from the item lookup. Only the `no item` count in the
+  Summary sheet shows it.
+- **An app that holds its map id under a key outside `MAP_KEYS` has no row in `Edges`.**
+  Absence from the sheet is not a clean result.
+- **After a failed item lookup, read the Summary sheet before you trust the edge count.** A
+  candidate id whose lookup failed is dropped from `Edges` and counted in the Summary row
+  `candidate ids that were not web maps` as `lookup failed N`. The console line and the exit
+  code do not show it.
+- **Owner names compare as exact strings.** `Alice` and `alice` are two owners.
+- **A private map owned by A, with a layer shared to groups owned by B, reads OK.** sightline
+  does not check that A is in those groups.
+- **The edge reason for a public app on a group-shared map reads "shared shared".** The words
+  are awkward and the verdict is right.
+- **The report path check runs once, before the audit.** A second run that writes the same
+  path during the audit replaces the file without `--apply`. The locked-file fallback also
+  writes a new `<name>_HHMMSS.xlsx` without `--apply`, and its name has one-second
+  resolution, so two locked runs in the same second share a name. The default output name has
+  the same resolution.
+- **Error text is copied into the report.** The text of a failed request or read goes into
+  the `Reason` column and the console as the exception gives it. An exception that echoes its
+  request url could carry a token from a legacy token-in-query login. `clean_url()` cleans the
+  layer url columns only.
+- **An item title with a lone surrogate stops the Excel write.** It is reachable only through
+  the REST API, and it raises `UnicodeEncodeError` at the end of the run.
+- **A title longer than 32767 characters is cut.** openpyxl cuts it in the workbook without a
+  message.
+- **Non-ASCII text can stop the console.** Printing an organization name or an error with
+  characters outside the console code page, such as cp1252 in a redirected scheduled run,
+  raises `UnicodeEncodeError`.
+- **Hyperlink cells keep the url scheme.** A `javascript:`, `file:` or UNC url from a hostile
+  web map becomes a clickable link. A url over about 2079 characters may make Excel offer to
+  repair the file. Do not click links in a report from an organization you do not trust.
+- **`fetch_groups()` expects the reply shape it knows.** A group block that is not an object
+  raises an `AttributeError`. This needs a malformed reply.
+- **`connect()` ignores `ARCGIS_PASS` when a Pro session is found.** That happens when no
+  username is set.
+- **`USERNAME` and `PASSWORD` in the config block win over the environment.** The safe
+  path, an environment variable or the prompt, is a convention. Nothing enforces it.
+- **The Mass.gov link was not opened by the author.** The page returned HTTP 403 to a
+  scripted fetch, and a search did not confirm the exact address. Check that it resolves.
+- **The "Product License has not been initialized" failure is reported, not reproduced.** It
+  comes from scheduled-task experience. The self-test does not trigger it. The wrapper above
+  ran in the self-test environment, and `arcgis.gis` imported with `arcpy` blocked.
+- **Coverage on a bare interpreter is 84 percent.** Without pandas and openpyxl the Excel
+  writer and the whole-run tests cannot execute, so 233 statements are missed. Those are
+  the lines in `write_excel()`, `save_report()` and `_t_report()`. With both libraries it is
+  100 percent.
 
 ## Contributing
 
