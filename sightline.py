@@ -382,6 +382,11 @@ def probe(url, cache, fails):
     if key in cache:
         return cache[key]
     h = host(key)
+    # urlopen also opens file:, ftp: and UNC-style urls.  A web map is data any member can
+    # author, so a file:////host/share url would make this machine open an SMB connection.
+    if urllib.parse.urlparse(key).scheme.lower() not in ("http", "https"):
+        cache[key] = res = ("UNKNOWN", "only http and https urls are probed")
+        return res
     head, _, query = key.partition("?")
     ask = [q for q in query.split("&") if q and q.split("=")[0].lower() != "f"]
     # ponytail: per-host circuit breaker. Without it one unreachable on-prem box x 50 urls
@@ -409,7 +414,7 @@ def probe(url, cache, fails):
         else:
             err = body.get("error")
             # A third-party JSON endpoint may answer {"error": "text"} or a list as the code.
-            code = err.get("code", 0) if isinstance(err, dict) else None
+            code = err.get("code") if isinstance(err, dict) else None
             if not err:
                 res = ("PUBLIC", "")
             elif isinstance(code, (int, float, str)):
@@ -435,6 +440,11 @@ def covers(la, lg, lown, ma, mg, mown, titles=None):
     if ma == "private":
         if la == "private" and lown != mown:
             return False, "private layer owned by %s" % (lown or "another user")
+        if la == "shared" and lown != mown:
+            # The owner sees an item shared to groups only if the owner is in one of them, and
+            # membership is not read.  OK here would be a check that never ran.
+            return None, ("private map; the layer is group-shared by %s and the map owner's "
+                          "group membership is not read" % (lown or "another user"))
         return True, "private map; the audience is the owner only"
     if la == "org":
         if ma == "public":
@@ -591,6 +601,9 @@ def edge_verdict(aa, ag, aown, ma, mg, mown, titles=None):
             return "UNKNOWN", ("app is shared to groups and the web map is org-only; group "
                                "members from another organisation cannot load it, and "
                                "membership is not read")
+        if aa == "private":
+            return "UNKNOWN", ("app is private and the web map is group-shared by %s; the app "
+                               "owner's group membership is not read" % (mown or "another user"))
         return "UNKNOWN", why
     if ok:
         return "OK", "every viewer of the app can load the web map"
@@ -605,15 +618,29 @@ def edge_verdict(aa, ag, aown, ma, mg, mown, titles=None):
 def build_edges(apps, errors, items, gids, gtitle, base, unresolved=()):
     """-> (edge rows, Counter of candidate ids that did not become an edge).
 
-    A candidate that resolves to a layer, a scene or any non-map item is dropped, as is one
-    that resolves to nothing; the counter says how many of each so the loss is visible.
+    A candidate that resolves to a layer, a scene or any non-map item is dropped and counted.
+    A candidate that resolves to nothing, or whose lookup failed, is counted and also becomes
+    an UNKNOWN row: it may be the web map this app is shared wider than, and a missing row
+    would read as a clean result.
     """
     rows, skipped = [], collections.Counter()
     for meta, cands in apps:
         for cid in cands:
             it = items.get(cid)
             if it is None:
-                skipped["lookup failed" if cid in unresolved else "no item"] += 1
+                failed = cid in unresolved
+                skipped["lookup failed" if failed else "no item"] += 1
+                row = dict(meta)
+                row.update({
+                    "Severity": SEV.get(meta["AppAccess"], "4 Info"), "Verdict": "UNKNOWN",
+                    "MapId": cid, "MapUrl": base + cid,
+                    "Reason": ("web map lookup failed; whether the app is shared wider than it "
+                               "is not verified" if failed else
+                               "the id under a map key matches no item the signed-in account can "
+                               "see (deleted, or private to another user); not verified"),
+                    "AppGroups": "; ".join(sorted(gtitle.get(g, g) for g in (gids.get(meta["AppId"]) or ()))),
+                })
+                rows.append(row)
                 continue
             if it["type"] != "Web Map":
                 skipped["not a web map"] += 1
@@ -786,6 +813,27 @@ def wcag_check(meta, title, snippet, description, found):
 
 # --------------------------------------------------------------------------- phase 6-7
 
+def trusted_service(url, portal_url):
+    """May the signed-in session talk to this layer url?  Same scheme and host as the portal,
+    or, for an ArcGIS Online portal, any https host under arcgis.com (hosted services).
+
+    The arcgis library adds the session token to every request, whatever the host, and a
+    layer url is data any org member can author.  Federated servers on other hosts are
+    skipped, not guessed at.
+    """
+    try:
+        want, got = urllib.parse.urlparse(portal_url), urllib.parse.urlparse(url)
+        want_host, got_host = (want.hostname or "").lower(), (got.hostname or "").lower()
+        same_origin = got.scheme == want.scheme and got.port == want.port
+    except ValueError:                      # a malformed port or bracketed host
+        return False
+    if not got_host or not same_origin:
+        return False
+    online = want_host == "arcgis.com" or want_host.endswith(".arcgis.com")
+    return got_host == want_host or (
+        online and (got_host == "arcgis.com" or got_host.endswith(".arcgis.com")))
+
+
 def deep_stats(gis, urls):
     """--deep only.  Cached BY URL: many web-map layers share one FeatureServer endpoint."""
     if FeatureLayer is None:
@@ -794,12 +842,48 @@ def deep_stats(gis, urls):
     for u in sorted(urls):
         if not FS_RE.search(u.lower()):
             continue
+        if not trusted_service(u, gis.url):
+            out[u] = ("", "skipped: not a portal or arcgis.com host")
+            continue
         try:
             fl = FeatureLayer(u, gis)
             out[u] = (fl.query(return_count_only=True),
                       iso((fl.properties.get("editingInfo") or {}).get("lastEditDate")))
         except Exception as e:
             out[u] = ("", type(e).__name__)
+    return out
+
+
+VIEW_ALL = "portal:admin:viewItems"      # Esri privilege: "view all content in the organization"
+
+
+def can_view_all(user):
+    """Does the signed-in user hold the View all content privilege?
+
+    Without it the search sees only what is shared with that account, and a clean report
+    would describe a smaller organization than the real one.  The arcgis User raises KeyError,
+    not AttributeError, for a missing key, so any failure to read the list means no.
+    """
+    try:
+        privileges = user.privileges
+    except Exception:
+        return False
+    return isinstance(privileges, (list, tuple, set)) and VIEW_ALL in privileges
+
+
+def incomplete_reasons(errors, app_errors, n_maps, limit, unresolved, no_groups, sees_all):
+    """Why a run that wrote a report still did not audit everything.  [] = complete."""
+    out = []
+    if errors or app_errors:
+        out.append("%d maps and %d apps could not be read" % (len(errors), len(app_errors)))
+    if not n_maps and limit != 0:
+        out.append("no web maps were scanned")
+    if unresolved:
+        out.append("%d item ids could not be looked up" % len(unresolved))
+    if no_groups:
+        out.append("%d items have no group data" % len(no_groups))
+    if not sees_all:
+        out.append("the account lacks the %s privilege, so unshared items are invisible" % VIEW_ALL)
     return out
 
 
@@ -846,22 +930,44 @@ def summarize(rows, meta, edges=None, wcag=None):
                         columns=["Section", "Metric", "Value"])
 
 
-def save_report(path, findings, all_rows, summary, extra=()):
-    """write_excel, but never lose a completed audit to a locked output file.
+def report_names(path):
+    """path, then path with a time stamp, then the stamp with a counter.  Finite on purpose."""
+    yield path
+    stem, ext = os.path.splitext(path)
+    stamp = datetime.datetime.now().strftime("%H%M%S")
+    yield "%s_%s%s" % (stem, stamp, ext)
+    for n in range(2, 50):
+        yield "%s_%s_%d%s" % (stem, stamp, n, ext)
 
-    Re-running with the previous report still open in Excel is the single most likely
-    real-world failure for this audience, and it would otherwise discard a run that has
-    already spent minutes of API calls.
+
+def save_report(path, findings, all_rows, summary, extra=(), apply=False):
+    """write_excel, but never lose a completed audit and never replace a file without --apply.
+
+    The existence check in main() runs before a multi-minute audit, so a file can appear, or
+    the old report can be open in Excel, by the time this runs.  Only the named path with
+    --apply may replace anything: every other write is an exclusive create ("xb"), which the
+    operating system refuses when the name exists, so two runs in one second cannot overwrite
+    each other.  A name that is taken or locked moves the write to the next free name.
     """
-    try:
-        write_excel(path, findings, all_rows, summary, extra)
-        return path
-    except PermissionError:
-        stem, ext = os.path.splitext(path)
-        alt = "%s_%s%s" % (stem, datetime.datetime.now().strftime("%H%M%S"), ext)
-        print("  %s is locked (open in Excel?); writing %s instead" % (path, alt))
-        write_excel(alt, findings, all_rows, summary, extra)
-        return alt
+    # Build the whole workbook in memory first: opening the old report to replace it truncates
+    # it, and a failure while building must not cost the previous report.
+    buf = io.BytesIO()
+    write_excel(buf, findings, all_rows, summary, extra)
+    last = None
+    for name in report_names(path):
+        try:
+            with open(name, "wb" if apply and name == path else "xb") as fh:
+                fh.write(buf.getvalue())
+        except FileExistsError as e:
+            last, why = e, "already exists and --apply was not given"
+        except PermissionError as e:
+            last, why = e, "is locked (open in Excel?)"
+        else:
+            if name != path:
+                print("  wrote %s instead of %s" % (name, path))
+            return name
+        print("  %s %s" % (name, why))
+    raise last
 
 
 def defuse(ws):
@@ -894,7 +1000,10 @@ def scrub(df):
 
 
 def write_excel(path, findings, all_rows, summary, extra=()):
-    """extra: (sheet name, DataFrame, hyperlink columns) for the optional --edges/--wcag sheets."""
+    """path: a file name or a binary file object.
+
+    extra: (sheet name, DataFrame, hyperlink columns) for the optional --edges/--wcag sheets.
+    """
     sheets = [("Findings", findings, ("MapUrl", "LayerUrl")),
               ("AllLayers", all_rows, ("MapUrl", "LayerUrl")),
               ("Summary", summary, ())] + list(extra)
@@ -1053,13 +1162,13 @@ class _Con(object):
 
 
 class _Gis(object):
-    def __init__(self, rest, items, fail_ids=(), leak=None):
+    def __init__(self, rest, items, fail_ids=(), leak=None, privileges=(VIEW_ALL,)):
         self.url = "https://portal.test/"
         self._portal = types.SimpleNamespace(resturl=rest)
         self._con = _Con()
         self.content = _Content(items, fail_ids, leak)
         self.properties = {"name": "Test Org", "id": "org1"}
-        self.users = types.SimpleNamespace(me=types.SimpleNamespace(username="admin"))
+        self.users = types.SimpleNamespace(me=types.SimpleNamespace(username="admin", privileges=list(privileges)))
 
 
 _MEMBERS = {"m1": ["g1", "g2"], "l1": ["g1"], "e1": [], "d1": ["g1"],
@@ -1080,6 +1189,7 @@ _ROUTES = {
     "/errnum/FeatureServer/0": (200, '{"error": 5}'),
     "/errcode/FeatureServer/0": (200, '{"error": {"code": [1]}}'),
     "/errstrcode/FeatureServer/0": (200, '{"error": {"code": "498"}}'),
+    "/nocode/FeatureServer/0": (200, '{"error": {"message": "x"}}'),
 }
 
 
@@ -1258,6 +1368,25 @@ def _t_helpers(t):
         inside = box.x
     check(inside == 2 and box.x == 1, "_setattr() restores the attribute")
 
+    class KeyErrorUser(object):
+        @property
+        def privileges(self):
+            raise KeyError("privileges")          # what the arcgis User raises for a missing key
+
+    ok_user = types.SimpleNamespace(privileges=["portal:user:createItem", VIEW_ALL])
+    check(can_view_all(ok_user) and not can_view_all(types.SimpleNamespace(privileges=["portal:user:createItem"]))
+          and not can_view_all(KeyErrorUser()) and not can_view_all(types.SimpleNamespace(privileges=VIEW_ALL))
+          and not can_view_all(types.SimpleNamespace(privileges=None)),
+          "can_view_all() wants the View all content privilege in a list, and treats anything unreadable as no")
+    check(incomplete_reasons([], [], 5, None, set(), set(), True) == []
+          and len(incomplete_reasons(["e"], ["a"], 0, None, {"i"}, {"g"}, False)) == 5
+          and incomplete_reasons([], [], 0, 0, set(), set(), True) == [],
+          "a complete run has no reasons, and --limit 0 is not an empty org")
+    names = list(report_names("d/r.xlsx"))
+    check(names[0] == "d/r.xlsx" and names[1].startswith("d/r_") and names[2] == names[1][:-5] + "_2.xlsx"
+          and len(names) == len(set(names)) == 50,
+          "report_names() yields the asked name, a stamped name, then a counted one, and stops")
+
 
 def _t_harness(t):
     """The harness must be able to fail, or every PASS below it means nothing."""
@@ -1342,8 +1471,14 @@ def _t_matrix(t):
           "a layer shared to more groups than the map still covers it")
     # a map shared to zero groups normalizes to private.  Probed with an unknown-group layer:
     # without normalization this is UNKNOWN, with it the map is owner-only -> OK.
-    check(verdict("item", "", "shared", None, "other", "shared", set(), u, titles)[0] == "OK",
+    check(verdict("item", "", "shared", None, u, "shared", set(), u, titles)[0] == "OK",
           "a map shared to zero groups is owner-only")
+    unsure, why = covers("shared", g1, "other", "private", None, u, titles)
+    check(unsure is None and "group membership is not read" in why
+          and verdict("item", "", "shared", g1, "other", "private", None, u, titles)[0] == "UNKNOWN",
+          "a group-shared layer from another owner in a private map is unknown, not OK  <-- pinned defect")
+    check(c("shared", "private", g1, None, lown=u) is True and c("org", "private", None, None, lown="other") is True,
+          "a private map still covers a group layer it owns and an org layer anyone owns")
     check(verdict("item", "", "shared", None, "other", "shared", g1, u, titles)[0] == "UNKNOWN",
           "unknown layer groups are unknown, not broken")
     # a private layer owned by someone else is invisible even inside a private map
@@ -1544,6 +1679,16 @@ def _t_probe(t, base, log):
               "a 200 whose error is a %s is unknown, not a crash  <-- pinned defect" % want)
     check(go("/errstrcode/FeatureServer/0") == ("UNKNOWN", "code 498"),
           "a string error code is not one of the integer codes, so it stays unknown")
+    check(go("/nocode/FeatureServer/0") == ("UNKNOWN", "error reply of unknown shape"),
+          "an error object with no code is an unknown shape, not 'code 0'  <-- pinned defect")
+    mark = len(log)
+
+    opened = []
+    with _setattr(urllib.request, urlopen=lambda *a, **kw: opened.append(a)):
+        odd = [probe(u, cache, fails) for u in ("file:////host/share/x/FeatureServer/0",
+                                                "ftp://127.0.0.1/x/FeatureServer/0", "//x/FeatureServer/0")]
+    check(odd == [("UNKNOWN", "only http and https urls are probed")] * 3 and len(log) == mark and not opened,
+          "a file:, ftp: or scheme-less layer url is never opened, so no SMB or FTP request leaves  <-- pinned defect")
     # a failure, a success, a failure ...: only consecutive failures open the circuit
     fresh, fresh_cache = collections.Counter(), {}
     for route in ("/drop10", "/ok/FeatureServer/0?a=1", "/drop11", "/ok/FeatureServer/0?a=2", "/drop12"):
@@ -1637,12 +1782,36 @@ def _t_portal(t, rest):
         def query(self, return_count_only):
             return 42 if return_count_only is True else {"features": []}
 
-    urls = {"https://x/rest/a/FeatureServer/0", "https://x/rest/a/FeatureServer/1", "https://x/rest/a/MapServer/0"}
+    urls = {"https://portal.test/rest/a/FeatureServer/0", "https://portal.test/rest/a/FeatureServer/1",
+            "https://portal.test/rest/a/MapServer/0"}
     with _patched(FeatureLayer=FL):
         stats = deep_stats(gis, urls)
-    check(stats == {"https://x/rest/a/FeatureServer/0": (42, "2023-11-14 22:13:20+00:00"),
-                    "https://x/rest/a/FeatureServer/1": ("", "OSError")},
+    check(stats == {"https://portal.test/rest/a/FeatureServer/0": (42, "2023-11-14 22:13:20+00:00"),
+                    "https://portal.test/rest/a/FeatureServer/1": ("", "OSError")},
           "deep_stats() counts feature layers, records a failure by type, skips other services, got %s" % stats)
+    sent = []
+
+    class Spy(FL):
+        def __init__(self, url, g):
+            sent.append(url)
+            FL.__init__(self, url, g)
+
+    foreign = {"https://evil.test/x/FeatureServer/0", "http://portal.test/x/FeatureServer/0",
+               "https://portal.test:8443/x/FeatureServer/0", "https://portal.test.evil.test/x/FeatureServer/0",
+               "https://portal.test/x/FeatureServer/0"}
+    with _patched(FeatureLayer=Spy):
+        stats = deep_stats(gis, foreign)
+    check(sent == ["https://portal.test/x/FeatureServer/0"] and len(stats) == 5
+          and stats["https://evil.test/x/FeatureServer/0"][1].startswith("skipped"),
+          "--deep never sends the session to a host other than the portal's  <-- pinned defect")
+    online = "https://myorg.maps.arcgis.com"
+    check(trusted_service("https://services1.arcgis.com/x/FeatureServer/0", online)
+          and trusted_service("https://arcgis.com/x/FeatureServer/0", "https://www.arcgis.com")
+          and not trusted_service("https://evilarcgis.com/x/FeatureServer/0", online)
+          and not trusted_service("https://services1.arcgis.com/x/FeatureServer/0", "https://gis.test/portal")
+          and not trusted_service("https://services1.arcgis.com:99999/x", online)
+          and not trusted_service("https:///x", online),
+          "hosted services under arcgis.com are trusted for an ArcGIS Online portal only, by whole label")
     fake = types.ModuleType("arcgis")
     fake_features = types.ModuleType("arcgis.features")
     fake_features.FeatureLayer = FL
@@ -1650,7 +1819,7 @@ def _t_portal(t, rest):
     fake_gis.GIS = object
     with _patched(FeatureLayer=None, GIS=None), _modules(arcgis=fake, **{"arcgis.features": fake_features,
                                                                          "arcgis.gis": fake_gis}):
-        stats = deep_stats(gis, {"https://x/rest/a/FeatureServer/0"})
+        stats = deep_stats(gis, {"https://portal.test/rest/a/FeatureServer/0"})
     check(list(stats.values()) == [(42, "2023-11-14 22:13:20+00:00")],
           "deep_stats() loads the ArcGIS library itself when it has not been loaded")
     with _patched(FeatureLayer=None, GIS=None), _modules(arcgis=None, **{"arcgis.gis": None, "arcgis.features": None}):
@@ -1719,6 +1888,10 @@ def _t_edges(t, rest):
           "a private app on another user's private map is broken")
     check(ev("private", "org")[0] == "OK" and ev("private", "shared", None, g1)[0] == "OK",
           "a private app is seen by its owner only, and the owner can open an org or group map")
+    verdict_, why = ev("private", "shared", None, g1, mown="bob")
+    check(verdict_ == "UNKNOWN" and "app owner's group membership is not read" in why
+          and ev("private", "shared", None, g1, aown="bob", mown="bob")[0] == "OK",
+          "a private app on another owner's group-shared map is unknown, not OK  <-- pinned defect")
     verdict_, why = ev("shared", "shared", g2, g1)
     check(verdict_ == "BROKEN" and why == "app is shared to groups the web map is not: Beta",
           "a group app shared to a group the map is not names that group")
@@ -1789,7 +1962,7 @@ def _t_edges(t, rest):
     gids = {"d1": set(), "s1": set(), "x2": set(), "w1": g2, ids["m-grp"]: g1, ids["m-org"]: set(), ids["m-pub"]: set()}
     rows, skipped = build_edges(apps, errors, maps, gids, titles, "https://portal.test/home/item.html?id=",
                                 {ids["ghost"]})
-    by_app = dict((r["AppId"], r) for r in rows)
+    by_app = dict((r["AppId"], r) for r in rows if r.get("MapId") != ids["ghost"])
     check(by_app["d1"]["Verdict"] == "BROKEN" and by_app["d1"]["Severity"] == "1 High",
           "a public dashboard on an org map is a High finding")
     check(by_app["s1"]["Verdict"] == "OK" and by_app["s1"]["Severity"] == "",
@@ -1804,12 +1977,21 @@ def _t_edges(t, rest):
           "an app that could not be read is an UNKNOWN row")
     check(dict(skipped) == {"not a web map": 1, "lookup failed": 1},
           "candidates that were a layer or unresolved are counted, got %s" % dict(skipped))
+    ghost = [r for r in rows if r.get("MapId") == ids["ghost"]]
+    check(len(ghost) == 1 and ghost[0]["Verdict"] == "UNKNOWN" and ghost[0]["Severity"] == "1 High"
+          and ghost[0]["AppId"] == "d1" and "lookup failed" in ghost[0]["Reason"]
+          and ghost[0]["MapUrl"].endswith(ids["ghost"]),
+          "an embedded id whose lookup failed is an UNKNOWN row at the app's severity, not a missing row  <-- pinned defect")
     rows2, skipped2 = build_edges(apps, [], maps, gids, titles, "b", set())
+    ghost2 = [r for r in rows2 if r.get("MapId") == ids["ghost"]]
     check(skipped2["no item"] == 1 and skipped2["lookup failed"] == 0,
           "an id that resolves to nothing, with no failed lookup, is counted as no item")
-    check(rows2[0]["MapUrl"].startswith("b") and rows2[0]["MapTitle"] in ("Org", "Pub", "Grp"),
+    check(len(ghost2) == 1 and ghost2[0]["Verdict"] == "UNKNOWN" and "matches no item" in ghost2[0]["Reason"],
+          "an embedded id with no item is an UNKNOWN row too, so a public app on a deleted map is not clean  <-- pinned defect")
+    good = [r for r in rows2 if r.get("MapTitle")]
+    check(good[0]["MapUrl"].startswith("b") and good[0]["MapTitle"] in ("Org", "Pub", "Grp"),
           "an edge row carries the map title and url")
-    check(set(EDGE_COLS) <= set(rows[0]) and set(rows[0]) <= set(EDGE_COLS) | {"Verdict"},
+    check(set(EDGE_COLS) <= set(rows[0]) and all(set(r) <= set(EDGE_COLS) for r in rows + ghost),
           "every edge row fits the EDGE_COLS sheet layout")
     check(cand == sorted([ids["m-org"], ids["m-pub"], ids["m-grp"], ids["lay"], ids["ghost"]]),
           "collect_apps() surfaces every candidate id, including a layer and an unknown one")
@@ -1817,10 +1999,10 @@ def _t_edges(t, rest):
 
 def _t_wcag(t):
     check = t.check
-    meta = {"MapTitle": "Parks", "MapId": "m1", "MapOwner": "u", "MapAccess": "public",
+    meta = {"MapTitle": "Visitor map", "MapId": "m1", "MapOwner": "u", "MapAccess": "public",
             "MapViews": 5, "MapUrl": "https://p/m1"}
 
-    def rules(title="Parks", snippet="s", description="", layers=(), meta=meta):
+    def rules(title="Visitor map", snippet="s", description="", layers=(), meta=meta):
         found = [("operationalLayers", lyr) for lyr in layers]
         return [r["Rule"] for r in wcag_check(meta, title, snippet, description, found)]
 
@@ -1860,7 +2042,7 @@ def _t_wcag(t):
     check(rules(snippet=None, description=None) == ["map-no-summary"], "missing summary fields are flagged")
     check(rules(snippet="", description="<p> </p><br/>") == ["map-no-summary"],
           "a description that is only tags is empty")
-    check(rules(snippet="", description="<p>Parks open in summer</p>") == [], "a description is enough")
+    check(rules(snippet="", description="<p>Open in summer</p>") == [], "a description is enough")
     check(rules(snippet="  ", description="") == ["map-no-summary"], "a blank summary does not count")
 
     # layer-level rules
@@ -1871,7 +2053,7 @@ def _t_wcag(t):
           "a layer with the pop-up disabled is flagged")
     check(rules(layers=[{"title": "T", "disablePopup": False}, {"title": "U"}]) == [],
           "a layer that leaves pop-ups on is not")
-    check(wcag_check(meta, "Parks", "s", "", [("baseMap", {"url": "u"})]) == [],
+    check(wcag_check(meta, "Visitor map", "s", "", [("baseMap", {"url": "u"})]) == [],
           "base map layers are Esri's and are never judged")
 
     def uv(*symbols, **kw):
@@ -1964,7 +2146,7 @@ def _t_wcag(t):
     check(all(set(r) == set(WCAG_COLS) for r in rows), "every rule row fits the WCAG_COLS sheet layout")
     check(wcag_check(meta, "Untitled", "", "", [("operationalLayers", {"itemId": "abc"})])[2]["Layer"] == "abc",
           "an untitled layer is named by its item id in the report")
-    named = wcag_check(meta, "Parks", "s", "", [("operationalLayers", {"url": "https://u:p@h/x?token=TOP7&a=1"})])
+    named = wcag_check(meta, "Visitor map", "s", "", [("operationalLayers", {"url": "https://u:p@h/x?token=TOP7&a=1"})])
     check(named[0]["Layer"] == "https://h/x?a=1" and "TOP7" not in repr(named),
           "an untitled layer named by its url shows no token or password  <-- pinned defect")
     check(set(r for r in WCAG_RULES) == set(["map-title-placeholder", "map-no-summary", "layer-no-title",
@@ -2155,22 +2337,60 @@ def _t_report(t, tmp, rest):
               and f["D2"].data_type == "s", "headers are frozen and a formula-shaped title is stored as text")
         check(f["H2"].hyperlink is not None and f["I2"].value == "L", "map links are live and control characters are gone")
         check(wb["Edges"]["K2"].hyperlink is not None, "extra sheets get live links on the columns they name")
-        real = write_excel
-        state = []
-
-        def locked(path, *args):
-            state.append(path)
-            if len(state) == 1:
-                raise PermissionError("locked")
-            return real(path, *args)
-
+        summ = summarize(rows, {})
         target = os.path.join(tmp, "locked.xlsx")
-        with _patched(write_excel=locked), _quiet() as (out, _):
-            written = save_report(target, findings, df, summarize(rows, {}))
-        check(written != target and os.path.exists(written) and "is locked" in out.getvalue(),
+        real_open = open
+
+        def locked_open(name, mode="r"):
+            if name == target:
+                raise PermissionError("locked")
+            return real_open(name, mode)
+
+        with _patched(open=locked_open), _quiet() as (out, _):
+            written = save_report(target, findings, df, summ, (), True)
+        check(written != target and os.path.exists(written) and not os.path.exists(target)
+              and "is locked" in out.getvalue(),
               "a locked report is written under a second name, never lost  <-- pinned defect")
-        check(save_report(os.path.join(tmp, "free.xlsx"), findings, df, summarize(rows, {})).endswith("free.xlsx"),
+        free = os.path.join(tmp, "free.xlsx")
+        check(save_report(free, findings, df, summ) == free and os.path.exists(free),
               "an unlocked report is written where it was asked to be")
+
+        # a name that appeared during the run is never replaced without --apply
+        late = os.path.join(tmp, "late.xlsx")
+        with real_open(late, "wb") as fh:
+            fh.write(b"first run")
+        fixed = datetime.datetime(2026, 1, 1, 12, 0, 5)
+        noon = types.SimpleNamespace(datetime=types.SimpleNamespace(now=lambda: fixed))
+        with _patched(datetime=noon), _quiet() as (out, _):
+            second = save_report(late, findings, df, summ)
+            third = save_report(late, findings, df, summ)
+        with real_open(late, "rb") as fh:
+            kept = fh.read()
+        check(kept == b"first run" and second.endswith("late_120005.xlsx") and third.endswith("late_120005_2.xlsx")
+              and "already exists and --apply was not given" in out.getvalue(),
+              "a report that appeared during the run is not replaced without --apply, and a same-second "
+              "rerun does not overwrite the first  <-- pinned defect")
+        with _patched(datetime=noon), _quiet():
+            back = save_report(late, findings, df, summ, (), True)
+        with real_open(late, "rb") as fh:
+            head = fh.read(2)
+        check(back == late and head == b"PK", "--apply replaces the named report")
+
+        def broken(*args):
+            raise ValueError("cannot build")
+
+        with _patched(write_excel=broken):
+            t.raises(lambda: save_report(late, findings, df, summ, (), True),
+                     "a failure while building the workbook is not hidden")
+        with real_open(late, "rb") as fh:
+            check(fh.read(2) == b"PK", "a failed build leaves the previous report untouched  <-- pinned defect")
+
+        def never_open(name, mode="r"):
+            raise PermissionError("denied")
+
+        with _patched(open=never_open), _quiet():
+            t.raises(lambda: save_report(free, findings, df, summ, (), True),
+                     "when no name can be written the error is raised, not looped on", exc=PermissionError)
 
         # the whole run, against the stub and a fake portal
         org = "org1"
@@ -2183,7 +2403,7 @@ def _t_report(t, tmp, rest):
             {"title": "Drawn here", "featureCollection": {"layers": []}}]}
         bad_map = {"operationalLayers": [{"url": base + "/ok/FeatureServer/0", "disablePopup": True}]}
         pool = dict((i.id, i) for i in (
-            _Item(m1, title="Parks", owner="alice", access="public", data=pub_map, snippet="Park finder"),
+            _Item(m1, title="Visitor map", owner="alice", access="public", data=pub_map, snippet="Visitor finder"),
             _Item(m2, title="Untitled Map", owner="alice", access="org", data=bad_map),
             _Item(m3, title="Staff map", owner="alice", access="org", data={}, snippet="s"),
             _Item(lay, title="Org layer", owner="bob", access="org", kind="Feature Service", orgId=org),
@@ -2217,7 +2437,10 @@ def _t_report(t, tmp, rest):
 
         with _patched(connect=lambda: gis):
             code, out, err = run(["-o", out_path, "--edges", "--wcag"])
-        check(code == 0 and os.path.exists(out_path) and "findings of" in out, "a full run exits 0 and writes the report")
+        check(code == 0 and os.path.exists(out_path) and "3 findings of 6 layer refs in" in out
+              and "  2 app edges, 1 not openable by every viewer" in out and "  4 accessibility findings" in out
+              and "Read 2 apps (0 unreadable)" in out,
+              "a full run exits 0, writes the report and prints the console lines the README quotes")
         wb = openpyxl.load_workbook(out_path)
         check(wb.sheetnames == ["Findings", "AllLayers", "Summary", "Edges", "WCAG"],
               "--edges and --wcag add their own sheets, got %s" % wb.sheetnames)
@@ -2299,6 +2522,60 @@ def _t_report(t, tmp, rest):
             check(code == 3 and "INCOMPLETE" in out and os.path.exists(argv[1]),
                   "%s: the report is written and the exit code is 3, not 0  <-- pinned defect" % label)
 
+        # a run that could not tell must not read clean
+        m_org, m_lost, m_grp = _hid(60), _hid(61), "boom"
+        board = lambda n, *ids: _Item(_hid(n), title="Board", owner="alice", access="public", kind="Dashboard",
+                                      data={"widgets": [{"itemId": i} for i in ids]})
+        base_pool = [_Item(_hid(62), title="Front", owner="alice", access="public", data={}, snippet="s"),
+                     _Item(m_org, title="Staff", owner="alice", access="org", data={}, snippet="s")]
+        cases = (
+            ("an embedded map whose lookup failed", base_pool + [board(63, m_org)], {"fail_ids": [m_org]}, 3,
+             "item ids could not be looked up", "web map lookup failed"),
+            ("an embedded map that matches no item", base_pool + [board(64, m_lost)], {}, 0,
+             "", "matches no item"),
+            ("a group lookup that failed", base_pool + [_Item(m_grp, title="Boom", access="public", data={},
+                                                              snippet="s")], {}, 3,
+             "items have no group data", None),
+            ("an account without View all content", base_pool, {"privileges": []}, 3,
+             "lacks the portal:admin:viewItems privilege", None),
+        )
+        for n, (label, items_, kw, want_code, want_text, want_reason) in enumerate(cases):
+            path = os.path.join(tmp, "unsure%d.xlsx" % n)
+            gis_ = _Gis(rest, dict((i.id, i) for i in items_), **kw)
+            with _patched(connect=lambda gis_=gis_: gis_):
+                code, out, err = run(["-o", path, "--edges"])
+            edges = list(openpyxl.load_workbook(path)["Edges"].iter_rows(min_row=2, values_only=True))
+            check(code == want_code and os.path.exists(path) and want_text in out
+                  and ("INCOMPLETE" in out) == bool(want_code),
+                  "%s: exit %d and the report is written  <-- pinned defect" % (label, want_code))
+            if want_reason:
+                check(len(edges) == 1 and edges[0][1] == "UNKNOWN" and edges[0][0] == "1 High"
+                      and want_reason in edges[0][2] and "Traceback" not in err,
+                      "%s: the app gets an UNKNOWN High row, not an empty sheet  <-- pinned defect" % label)
+
+        # sheet order and the console lines the README quotes
+        gis_ = _Gis(rest, dict((i.id, i) for i in (
+            _Item(_hid(70), title="Zed", owner="alice", access="org", data={}, snippet="s", numViews=1),
+            _Item(_hid(71), title="Untitled Map", owner="alice", access="public", data={}, numViews=5),
+            _Item(_hid(75), title="Hidden", owner="alice", access="private", data={}, snippet="s"),
+            _Item(_hid(72), title="Org board", owner="alice", access="org", kind="Dashboard", numViews=1,
+                  data={"widgets": [{"itemId": _hid(75)}]}),
+            _Item(_hid(73), title="Open board", owner="alice", access="public", kind="Dashboard", numViews=9,
+                  data={"widgets": [{"itemId": _hid(70)}]}),
+            _Item(_hid(74), title="Quiet board", owner="alice", access="private", kind="Dashboard", numViews=90,
+                  data={"widgets": [{"itemId": _hid(70)}]}))))
+        order = os.path.join(tmp, "order.xlsx")
+        with _patched(connect=lambda: gis_):
+            code, out, err = run(["-o", order, "--edges", "--wcag"])
+        wb = openpyxl.load_workbook(order)
+        edges = [(r[1], r[4]) for r in wb["Edges"].iter_rows(min_row=2, values_only=True)]
+        wc = [(r[0], r[1]) for r in wb["WCAG"].iter_rows(min_row=2, values_only=True)]
+        check(edges == [("BROKEN", "Open board"), ("BROKEN", "Org board"), ("OK", "Quiet board")]
+              and "  3 app edges, 2 not openable by every viewer" in out and "  2 accessibility findings" in out,
+              "edges list findings first, then by audience, and the console counts match the sheets, got %s" % edges)
+        check(wc == [("1 High", "map-no-summary"), ("1 High", "map-title-placeholder")],
+              "accessibility rows are worst audience first, got %s" % wc)
+
         # a folder that does not exist is refused before any portal call
         gone = os.path.join(tmp, "no_such_folder", "r.xlsx")
 
@@ -2310,8 +2587,9 @@ def _t_report(t, tmp, rest):
               "an output folder that does not exist is refused before the audit starts  <-- pinned defect")
 
         deep = os.path.join(tmp, "deep.xlsx")
+        # the stub portal's own host is the one --deep trusts
         with _patched(GIS=lambda *a: gis, FeatureLayer=FL, USERNAME="", PASSWORD=""), \
-                _environ(ARCGIS_USER="svc", ARCGIS_PASS=secret, ARCGIS_URL=None):
+                _environ(ARCGIS_USER="svc", ARCGIS_PASS=secret, ARCGIS_URL=None), _setattr(gis, url=base + "/"):
             code, out, err = run(["-o", deep, "--deep"])
         wb = openpyxl.load_workbook(deep)
         head = [c.value for c in wb["AllLayers"][1]]
@@ -2381,6 +2659,7 @@ def main(argv=None):
     org = gis.properties["name"]
     org_id = gis.properties["id"]
     print("Connected to %s as %s" % (org, gis.users.me.username))
+    sees_all = can_view_all(gis.users.me)
 
     # `a.limit is None` rather than a truthiness test: --limit 0 must mean zero, not "all".
     maps = gis.content.search("", item_type="Web Map",
@@ -2398,7 +2677,9 @@ def main(argv=None):
     items, unresolved = resolve_items(gis, ids | cands)
     embedded = set(c for c in cands if c in items and items[c]["type"] == "Web Map")
     app_ids = set(m["AppId"] for m, _ in apps)
-    gids, gtitle = fetch_groups(gis, ids | set(m["id"] for m in maps) | embedded | app_ids)
+    want_groups = ids | set(m["id"] for m in maps) | embedded | app_ids
+    gids, gtitle = fetch_groups(gis, want_groups)
+    no_groups = want_groups - set(gids)         # their chunk failed, so their audience is unknown
 
     probes, fails = {}, collections.Counter()
     rows = build(refs, items, gids, gtitle, probes, fails, org_id, unresolved) + error_rows(errors)
@@ -2434,7 +2715,8 @@ def main(argv=None):
         ["Severity", "MapViews", "MapTitle", "LayerTitle"],
         ascending=[True, False, True, True])[FIND_COLS]
     meta["elapsed s"] = round(time.time() - t0, 1)
-    written = save_report(a.out, findings, df, summarize(rows, meta, edge_rows, wcag_rows), extra)
+    written = save_report(a.out, findings, df, summarize(rows, meta, edge_rows, wcag_rows), extra,
+                          a.apply)
 
     print("\n%d findings of %d layer refs in %.0fs -> %s"
           % (len(findings), len(df), time.time() - t0, written))
@@ -2445,11 +2727,11 @@ def main(argv=None):
               % (len(edge_rows), sum(1 for r in edge_rows if r["Verdict"] != "OK")))
     if a.wcag:
         print("  %d accessibility findings" % len(wcag_rows))
-    # A report was written, but a run that read nothing, or could not read some items, did not
-    # audit everything.  Exit 3 lets a scheduled task tell that from a complete run.
-    if errors or app_errors or (not maps and a.limit != 0):
-        print("  INCOMPLETE: %d maps and %d apps could not be read, %d maps were scanned; exit 3"
-              % (len(errors), len(app_errors), len(maps)))
+    # A report was written, but a run that read nothing, or could not tell for some items, did
+    # not audit everything.  Exit 3 lets a scheduled task tell that from a complete run.
+    why = incomplete_reasons(errors, app_errors, len(maps), a.limit, unresolved, no_groups, sees_all)
+    if why:
+        print("  INCOMPLETE: %s; exit 3" % "; ".join(why))
         return 3
     return 0
 
