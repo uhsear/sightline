@@ -3,11 +3,7 @@
 *.xlsx
 *.xls
 *.csv
-oracle_out.json
 reports/
-
-# The script this tool replaced. Internal work product, not ours to publish.
-AGOL Audit script*.txt
 
 # Credentials
 .env

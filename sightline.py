@@ -159,6 +159,8 @@ EDGE_TYPES = ("Dashboard", "Web Mapping Application", "StoryMap", "Web Experienc
 # item whose type is "Web Map".  A key missing from this list is a missed edge, not a wrong one.
 MAP_KEYS = ("itemId", "webmap", "webmapId", "mapId")
 ID_RE = re.compile(r"^[0-9a-fA-F]{32}$")
+# Web map layer types whose spec object has no url property at all: the OpenStreetMap and Bing layers.
+BUILTIN_TYPES = ("OpenStreetMap", "BingMapsAerial", "BingMapsHybrid", "BingMapsRoad")
 EDGE_COLS = ["Severity", "Verdict", "Reason", "AppType", "AppTitle", "AppId", "AppOwner",
              "AppAccess", "AppViews", "AppGroups", "AppUrl", "MapTitle", "MapId", "MapOwner",
              "MapAccess", "MapGroups", "MapUrl"]
@@ -267,20 +269,50 @@ def walk(data, out):
         _emit("baseMap", lyr, out)
 
 
+def _has_target(lyr):
+    """Does a layer dict point at something: an item, a service, a style, a tile template, data
+    drawn in the map, or a built-in base map?  A MapServer sublayer style override has none."""
+    return bool(lyr.get("url") or lyr.get("itemId") or lyr.get("featureCollection")
+                or lyr.get("templateUrl") or lyr.get("styleUrl")
+                or lyr.get("layerType") in BUILTIN_TYPES)
+
+
+def _kids(lyr):
+    """The children of a group layer that are references, or groups that hold references."""
+    return [c for c in (lyr.get("layers") or []) if isinstance(c, dict) and (_has_target(c) or _kids(c))]
+
+
 def _emit(section, lyr, out):
     if not isinstance(lyr, dict):
         return
     # ponytail: children are filtered to entries with a target, so MapServer sublayer
     # style-overrides (which also live under "layers") never leak in as phantom rows.
-    kids = [c for c in (lyr.get("layers") or [])
-            if isinstance(c, dict) and (c.get("url") or c.get("itemId"))]
-    if lyr.get("url") or lyr.get("itemId") or not kids:
+    kids = _kids(lyr)
+    if _has_target(lyr) or not kids:
         out.append((section, lyr))          # a GroupLayer shell with children is not itself a ref
     for c in kids:
         _emit(section, c, out)
 
 
 # --------------------------------------------------------------------------- phase 1-3
+
+MAP_DATA_KEYS = ("operationalLayers", "baseMap", "tables")
+
+
+def data_problem(data, keys, what):
+    """Why get_data() output cannot be trusted as the item's JSON, or None when it can.
+
+    The arcgis Item.get_data hides a failed read (timeout, 5xx, 403) and returns {}, so an
+    empty answer is not "no layers".  keys: at least one of these must be present (a web map
+    always carries a base map); () means any non-empty object will do.
+    """
+    if not isinstance(data, dict):
+        return "the %s data is %s, not JSON" % (what, type(data).__name__)
+    if not data or (keys and not any(k in data for k in keys)):
+        return ("the %s data came back empty or without %s; the read may have failed"
+                % (what, " or ".join(keys) if keys else "content"))
+    return None
+
 
 def collect(gis, maps, wcag_out=None):
     """One get_data per map (~0.09s).  A failed map yields an error tuple, never vanishes.
@@ -299,7 +331,11 @@ def collect(gis, maps, wcag_out=None):
             # walk() must stay inside the try: nested-corrupt map JSON (a string where
             # baseMap should be, an int under "tables") raises there, not in get_data,
             # and one such map would otherwise abort the whole run with no error row.
-            walk(m.get_data(try_json=True), found)
+            data = m.get_data(try_json=True)
+            why = data_problem(data, MAP_DATA_KEYS, "web map")
+            if why:
+                raise ValueError(why)
+            walk(data, found)
         except Exception as e:
             errors.append((meta, "%s: %s" % (type(e).__name__, e)))
         else:
@@ -478,6 +514,8 @@ def verdict(state, detail, la, lg, lown, ma, mg, mown, titles=None):
         return "DEAD", "service gone (%s)" % (detail or "no longer published")
     if state == "EMBEDDED":
         return "OK", "feature collection embedded in the map; nothing external to share"
+    if state == "BUILTIN":
+        return "OK", "built-in base map layer with no item or service address; nothing to share"
     if state in ("UNREACHABLE", "UNKNOWN", "NO_TARGET"):
         return "UNKNOWN", detail or "layer reference has no item id and no service url"
     if state == "SECURED":
@@ -513,6 +551,11 @@ def build(refs, items, gids, gtitle, probes, fails, org_id, unresolved=()):
             state = "MISSING_ITEM"
         elif lyr.get("featureCollection"):
             state = "EMBEDDED"
+        elif lyr.get("layerType") in BUILTIN_TYPES:
+            state = "BUILTIN"
+        elif lyr.get("templateUrl") or lyr.get("styleUrl"):
+            state, detail = "UNKNOWN", ("tile layer addressed by a template or style url, which is "
+                                        "not an item or a service; not probed")
         else:
             state = "NO_TARGET"
         mg = gids.get(meta["MapId"])
@@ -583,7 +626,11 @@ def collect_apps(gis, limit):
                     "AppOwner": app["owner"], "AppAccess": app["access"],
                     "AppViews": app.get("numViews", 0), "AppUrl": base + app["id"]}
             try:
-                apps.append((meta, map_candidates(app.get_data(try_json=True))))
+                data = app.get_data(try_json=True)
+                why = data_problem(data, (), "app")
+                if why:
+                    raise ValueError(why)
+                apps.append((meta, map_candidates(data)))
             except Exception as e:
                 errors.append((meta, "%s: %s" % (type(e).__name__, e)))
     return apps, errors
@@ -1031,6 +1078,7 @@ def write_excel(path, findings, all_rows, summary, extra=()):
 # Everything below the decision core is test scaffolding.  Nothing here runs in a live audit.
 
 _MISSING = object()
+_BLANK_MAP = {"operationalLayers": []}      # a web map with no layers, as the portal returns one
 
 
 def _hid(n):
@@ -1278,6 +1326,38 @@ def _footer(passed, failed, skipped=False):
     return 0
 
 
+def _harness_defect(cls, footer):
+    """Why the check()/raises() class or the footer cannot fail, or "" when both can.
+
+    Plain comparisons only, never check(): a harness cannot vouch for itself, and a check()
+    that always passes would otherwise pass its own test.
+    """
+    probe = cls()
+    with _quiet():
+        probe.check(True, "probe: a true condition")
+        probe.check(False, "probe: a false condition")
+        probe.raises(lambda: None, "probe: no error raised")
+        probe.raises(lambda: [][0], "probe: the right error", exc=IndexError)
+    if probe.passed != 2 or len(probe.failed) != 2:
+        return "check() or raises() does not count a failure"
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        red, green = footer(1, ["probe"]), footer(1, [])
+    if (red, green) != (1, 0):
+        return "the footer does not return 1 for a failure and 0 for a pass"
+    lines = buf.getvalue().splitlines()
+    if "2 assertions, 1 failed" not in lines or lines[-1] != "1 assertions, 0 failed":
+        return "the footer does not print the failure count and the final line"
+    return ""
+
+
+def _harness_gate(cls, footer):
+    """Stop the self-test before it prints a single PASS if its own harness is broken."""
+    defect = _harness_defect(cls, footer)
+    if defect:
+        sys.exit("self-test harness defect: %s; no result can be trusted" % defect)
+
+
 def self_test():
     """Run every assertion in a temp directory that is removed even when one raises.
 
@@ -1308,6 +1388,7 @@ def _have_report_libs():
 
 
 def _self_test(tmp, srv, log):
+    _harness_gate(_T, _footer)
     t = _T()
     base = "http://127.0.0.1:%d" % srv.server_address[1]
     rest = base + "/sharing/rest/"
@@ -1323,7 +1404,7 @@ def _self_test(tmp, srv, log):
     _t_wcag(t)
     _t_summary(t)
     _t_login(t)
-    _t_cli(t)
+    _t_cli(t, tmp)
     _t_source(t)
     with _modules(pandas=None):
         t.check(_have_report_libs() is False, "a missing pandas is detected, so the Excel assertions would skip")
@@ -1419,6 +1500,58 @@ def _t_harness(t):
           and lines[-1] == "2 assertions, 0 failed",
           "a run that skipped the Excel assertions says so above a footer that still ends the same way  <-- pinned defect")
 
+    class AlwaysPass(_T):
+        def check(self, cond, label):
+            self.passed += 1
+
+    class BlindRaises(_T):
+        def raises(self, fn, label, exc=ValueError):
+            self.check(True, label)
+
+    class NoFailureList(_T):
+        def check(self, cond, label):
+            self.passed += 1 if cond else 0
+
+    class PassTwice(_T):
+        def check(self, cond, label):
+            if cond:
+                self.passed += 2
+            else:
+                self.failed.append(label)
+
+    def never_red(passed, failed):
+        return 0
+
+    def trailing(passed, failed):
+        code = _footer(passed, failed)
+        print("done")
+        return code
+
+    def nocount(passed, failed):
+        if failed:
+            print("something failed")
+            return 1
+        return _footer(passed, failed)
+
+    def lying(passed, failed):
+        print("all good")
+        return 1 if failed else 0
+
+    check(_harness_defect(_T, _footer) == "" and _harness_gate(_T, _footer) is None,
+          "the real harness passes the independent test that runs before any other assertion")
+    check(_harness_defect(AlwaysPass, _footer).startswith("check() or raises()")
+          and _harness_defect(BlindRaises, _footer).startswith("check() or raises()")
+          and _harness_defect(NoFailureList, _footer).startswith("check() or raises()")
+          and _harness_defect(PassTwice, _footer).startswith("check() or raises()"),
+          "a check() that always passes, or a raises() that never fails, is caught without using check()  <-- pinned defect")
+    check(_harness_defect(_T, never_red).startswith("the footer does not return 1")
+          and _harness_defect(_T, lying).startswith("the footer does not print")
+          and _harness_defect(_T, trailing).startswith("the footer does not print")
+          and _harness_defect(_T, nocount).startswith("the footer does not print"),
+          "a footer that exits 0 on a failure, or hides the count and the last line, is caught  <-- pinned defect")
+    check(_exits(lambda: _harness_gate(AlwaysPass, _footer)).startswith("self-test harness defect: check()"),
+          "a broken harness stops the self-test before it prints a PASS  <-- pinned defect")
+
 
 def _t_matrix(t):
     """The sharing matrix of the original --self-check, one weight per audience pair."""
@@ -1481,6 +1614,9 @@ def _t_matrix(t):
           "a private map still covers a group layer it owns and an org layer anyone owns")
     check(verdict("item", "", "shared", None, "other", "shared", g1, u, titles)[0] == "UNKNOWN",
           "unknown layer groups are unknown, not broken")
+    check(covers("private", None, "", "private", None, "u")[1] == "private layer owned by another user"
+          and "group-shared by another user and" in covers("shared", g1, "", "private", None, u)[1],
+          "a layer with no owner name is attributed to another user")
     # a private layer owned by someone else is invisible even inside a private map
     check(c("private", "private", lown="bob", mown="alice") is False,
           "a private layer owned by someone else is invisible in a private map")
@@ -1640,6 +1776,49 @@ def _t_core(t):
     # Overexposed was deliberately kept out of Findings: it is a different axis
     check(rows[0]["Verdict"] == "OK" and rows[0]["Overexposed"] == "Yes",
           "an overexposed layer is OK in the verdict column")
+    secured = "https://h.example/s/FeatureServer/0"
+    row_s = build([(meta, "operationalLayers", {"url": secured})], {}, {}, {},
+                  {secured: ("SECURED", "code 499")}, collections.Counter(), org)[0]
+    check(row_s["LayerAccess"] == "" and row_s["LayerOwner"] == "" and row_s["Overexposed"] == ""
+          and row_s["LayerState"] == "SECURED" and row_s["Verdict"] == "UNKNOWN",
+          "a secured service never shows LayerAccess=public in AllLayers  <-- pinned defect")
+
+    # layer shapes the web map specification gives no url: OpenStreetMap, Bing, a tile template,
+    # a vector tile style, a group of embedded data, a group inside a group
+    deep_url = "https://h.example/d/FeatureServer/0"
+    spec_map = {"baseMap": {"baseMapLayers": [
+        {"layerType": "OpenStreetMap"}, {"layerType": "BingMapsAerial"}, {"layerType": "BingMapsHybrid"},
+        {"layerType": "BingMapsRoad"},
+        {"layerType": "WebTiledLayer", "templateUrl": "https://t.example/{level}/{col}/{row}.png"},
+        {"layerType": "VectorTileLayer", "styleUrl": "https://s.example/root.json"}]},
+        "operationalLayers": [
+            {"layerType": "GroupLayer", "title": "G", "layers": [
+                {"title": "Drawn", "featureCollection": {"layers": []}}]},
+            {"layerType": "GroupLayer", "title": "Outer", "layers": [
+                {"layerType": "GroupLayer", "title": "Inner", "layers": [{"title": "Deep", "url": deep_url}]}]}]}
+    found = []
+    walk(spec_map, found)
+    rows3 = build([(meta, sec, lyr) for sec, lyr in found], {}, {}, {}, {deep_url: ("PUBLIC", "")},
+                  collections.Counter(), org)
+    check(len(rows3) == 8 and [r["Verdict"] for r in rows3] == ["OK"] * 6 + ["UNKNOWN"] * 2
+          and not any("no item id" in r["Reason"] for r in rows3)
+          and [r["LayerTitle"] for r in rows3][:2] == ["Drawn", "Deep"],
+          "a map with OSM, Bing, tile-template, style-url, embedded-group and nested-group layers has no "
+          "false NO_TARGET finding  <-- pinned defect")
+    check([r["LayerState"] for r in rows3][2:] == ["BUILTIN"] * 4 + ["UNKNOWN"] * 2
+          and "template or style url" in rows3[6]["Reason"] and "template or style url" in rows3[7]["Reason"]
+          and rows3[2]["Severity"] == "",
+          "a built-in layer is OK, and a tile template or style url says why it was not checked")
+    check(verdict("BUILTIN", "", None, None, None, "public", None, u)[0] == "OK",
+          "a built-in base map layer is fine in a public map")
+    nothing = []
+    walk({"operationalLayers": [{"title": "Empty group", "layerType": "GroupLayer", "layers": []},
+                                {"title": "Override only", "url": "https://x/MapServer",
+                                 "layers": [{"id": 3, "popupInfo": {}}]}]}, nothing)
+    check([l["title"] for _, l in nothing] == ["Empty group", "Override only"]
+          and build([(meta, "operationalLayers", nothing[0][1])], {}, {}, {}, {}, collections.Counter(), org)[0]
+          ["LayerState"] == "NO_TARGET",
+          "a layer with no address of any kind is still NO_TARGET, and an override is not a layer")
 
 
 def _t_probe(t, base, log):
@@ -1719,17 +1898,20 @@ def _t_portal(t, rest):
           "a failed lookup chunk is announced")
     got, unresolved = resolve_items(gis, {"a1", "zz"})
     check(sorted(got) == ["a1"] and unresolved == set(), "an id with no item is missing, not unresolved")
-    asked = []
+    asked, kws = [], []
 
     class Spy(_Content):
         def search(self, query="", **kw):
             asked.append(query.count(" OR ") + 1)
+            kws.append(kw)
             return []
 
     spy = _Gis(rest, {})
     spy.content = Spy({})
     resolve_items(spy, set(_hid(n) for n in range(120)))
     check(asked == [50, 50, 20] and ITEM_CHUNK == 50, "item ids go out to the portal 50 per search, as the README says")
+    check([k["max_items"] for k in kws] == [100, 100, 40] and all(k["outside_org"] is True for k in kws),
+          "each search asks for room for two hits per id and looks outside the organization")
 
     gids, titles = fetch_groups(gis, {"m1", "l1", "e1"})
     check(gids == {"m1": {"g1", "g2"}, "l1": {"g1"}, "e1": set()} and titles == {"g1": "Alpha", "g2": "Beta"},
@@ -1771,6 +1953,34 @@ def _t_portal(t, rest):
     with _quiet():
         refs2, _ = collect(gis, maps[:1])
     check(len(refs2) == 1, "collect() without --wcag keeps working")
+    many = [_Item("p%02d" % n, data=_BLANK_MAP) for n in range(26)]
+    with _quiet() as (out, _):
+        collect(gis, many)
+    lines = out.getvalue().split("\n")
+    check([l.split("  ")[1] for l in lines if l] == ["25/26 maps", "26/26 maps"],
+          "progress prints every 25 maps and at the last one, and nowhere else")
+    check(errors[0][0]["MapViews"] == 0 and refs[0][0]["MapViews"] == 7,
+          "a map with no view count reads 0 views, not 1")
+
+    # arcgis Item.get_data (2.4.2) returns {} when the read fails, so an empty or non-JSON
+    # answer is an unreadable map, not a map with no layers
+    shapes = [{}, "text", b"x", [1], 5, None, {"title": "no map keys"}]
+    hidden = [_Item("h%d" % n, title="Hidden %d" % n, access="public", data=d) for n, d in enumerate(shapes)]
+    fine = [_Item("k1", data={"baseMap": {}}), _Item("k2", data={"tables": []}),
+            _Item("k3", data={"operationalLayers": []})]
+    with _quiet():
+        refs3, errors3 = collect(gis, hidden + fine)
+    check(refs3 == [] and [e[0]["MapId"] for e in errors3] == ["h%d" % n for n in range(7)]
+          and all(e[1].startswith("ValueError: the web map data ") for e in errors3),
+          "a web map whose read came back empty, non-JSON or without map keys is an error row, not a clean map  <-- pinned defect")
+    check(data_problem({}, MAP_DATA_KEYS, "web map").endswith("the read may have failed")
+          and "operationalLayers or baseMap or tables" in data_problem({"a": 1}, MAP_DATA_KEYS, "web map")
+          and data_problem({"a": 1}, (), "app") is None and "content" in data_problem({}, (), "app")
+          and data_problem([1], (), "app") == "the app data is list, not JSON",
+          "data_problem() names what is missing and accepts any non-empty object when no key is required")
+    with _quiet():
+        refs4, errors4 = collect(gis, hidden[:1] + fine[:1], [])
+    check(len(refs4) == 0 and len(errors4) == 1, "an unreadable map adds no accessibility rows")
 
     # deep_stats
     class FL(object):
@@ -1904,7 +2114,16 @@ def _t_edges(t, rest):
           "an app shared to no group is owner-only even when the map's groups are unknown  <-- pinned defect")
     verdict_, why = ev("public", "org")
     check(why == "app is shared public but the web map is shared org", "the reason names both audiences")
+    check(ev("public", "private")[1] == "app is shared public but the web map is shared private"
+          and ev("org", "private")[1] == "app is shared org but the web map is shared private",
+          "a public or org app on a private map names both audiences, not the private-app wording  <-- pinned defect")
+    check(ev("shared", "shared", None, g1)[1] == "group membership unavailable"
+          and ev("shared", "shared", g1, None)[1] == "group membership unavailable",
+          "unknown groups on a group app say so, not that the app is private  <-- pinned defect")
     # a map shared to no group is owner-only, whoever owns it
+    check(ev("private", "shared", None, g1, mown="")[1].endswith("by another user; the app owner's group membership is not read")
+          and ev("private", "private", mown="")[1] == "web map is private to another user; the app owner cannot load it",
+          "a web map with no owner name is attributed to another user")
     verdict_, why = ev("private", "shared", None, set(), mown="bob")
     check(verdict_ == "BROKEN" and why == "web map is private to bob; the app owner cannot load it",
           "a private app on another user's map that is shared to no group is broken  <-- pinned defect")
@@ -1936,7 +2155,7 @@ def _t_edges(t, rest):
                     data={"widgets": [{"type": "mapWidget", "itemId": ids["m-org"]},
                                       {"type": "list", "itemId": ids["lay"]},
                                       {"type": "map", "itemId": ids["ghost"]}]}),
-        "d2": _Item("d2", title="Second", access="private", owner="alice", kind="Dashboard", data={}),
+        "d2": _Item("d2", title="Second", access="private", owner="alice", kind="Dashboard", data={"widgets": []}),
         "x2": _Item("x2", title="Exp2", access="private", owner="alice", kind="Web Experience",
                     data={"dataSources": {"dataSource_1": {"type": "WEB_MAP", "itemId": ids["m-pub"]}}}),
         "s1": _Item("s1", title="Story", access="org", owner="alice", kind="StoryMap",
@@ -1954,10 +2173,20 @@ def _t_edges(t, rest):
     check(sorted(m["AppId"] for m, _ in apps) == ["d1", "d2", "s1", "w1", "x2"] and [e[0]["AppId"] for e in errors] == ["x1"],
           "collect_apps() reads each app once, even if two searches return it, and records a failure")
     check(apps[0][0]["AppUrl"] == "https://portal.test/home/item.html?id=d1", "an app row carries its item url")
+    check(dict((m["AppId"], m["AppViews"]) for m, _ in apps)["d2"] == 0
+          and dict((m["AppId"], m["AppViews"]) for m, _ in apps)["d1"] == 9,
+          "an app with no view count reads 0 views")
     with _patched(MAX_APPS=50):
         one, _ = collect_apps(gis, 1)
     check(len(one) == 4 and "d2" not in [m["AppId"] for m, _ in one],
           "--limit caps each item type: one dashboard, story, app and experience; got %d" % len(one))
+    blank = _Gis(rest, dict((i.id, i) for i in (
+        _Item("b1", kind="Dashboard", data={}), _Item("b2", kind="StoryMap", data="text"),
+        _Item("b3", kind="Web Experience", data=None), _Item("b4", kind="Web Mapping Application", data=[1]))))
+    apps_b, errs_b = collect_apps(blank, None)
+    check(apps_b == [] and sorted(e[0]["AppId"] for e in errs_b) == ["b1", "b2", "b3", "b4"]
+          and all(e[1].startswith("ValueError: the app data ") for e in errs_b),
+          "an app whose read came back empty or non-JSON is an error row, not an app that embeds nothing  <-- pinned defect")
     cand = sorted(set(c for _, cs in apps for c in cs))
     gids = {"d1": set(), "s1": set(), "x2": set(), "w1": g2, ids["m-grp"]: g1, ids["m-org"]: set(), ids["m-pub"]: set()}
     rows, skipped = build_edges(apps, errors, maps, gids, titles, "https://portal.test/home/item.html?id=",
@@ -1982,6 +2211,10 @@ def _t_edges(t, rest):
           and ghost[0]["AppId"] == "d1" and "lookup failed" in ghost[0]["Reason"]
           and ghost[0]["MapUrl"].endswith(ids["ghost"]),
           "an embedded id whose lookup failed is an UNKNOWN row at the app's severity, not a missing row  <-- pinned defect")
+    rows_g, _ = build_edges([({"AppId": "w1", "AppAccess": "shared", "AppOwner": "alice"}, [ids["ghost"]])], [],
+                            {}, gids, titles, "b", set())
+    check(rows_g[0]["AppGroups"] == "Alpha; Beta" and rows_g[0]["Verdict"] == "UNKNOWN",
+          "an UNKNOWN row for a missing web map still names the groups the app is shared to")
     rows2, skipped2 = build_edges(apps, [], maps, gids, titles, "b", set())
     ghost2 = [r for r in rows2 if r.get("MapId") == ids["ghost"]]
     check(skipped2["no item"] == 1 and skipped2["lookup failed"] == 0,
@@ -2024,6 +2257,9 @@ def _t_wcag(t):
           and abs(luminance((10.4, 10.4, 10.4)) - ((10.4 / 255.0 + 0.055) / 1.055) ** 2.4) < 1e-12
           and abs(luminance((30, 30, 30)) - ((30 / 255.0 + 0.055) / 1.055) ** 2.4) < 1e-12,
           "luminance uses s/12.92 up to 0.04045 and the 2.4 power above it  <-- pinned defect")
+    check(rgb_of([255, 255, 255, 255]) == (255, 255, 255) and rgb_of([1, 2, 256, 255]) is None
+          and rgb_of([256, 0, 0, 255]) is None,
+          "a channel of 255 is a color and 256 is not  <-- pinned defect")
     check(rgb_of([1, 2, 3, 255]) == (1, 2, 3) and rgb_of([1, 2, 3, 128]) is None
           and rgb_of([1, 2, 3]) is None and rgb_of("x") is None and rgb_of([1, 2, 3, 256]) is None
           and rgb_of([1, 2, "3", 255]) is None and rgb_of(None) is None,
@@ -2089,6 +2325,9 @@ def _t_wcag(t):
           "fill classes are judged by pattern")
     check(rules(layers=[uv({"type": "esriPMS", "url": "a.png"}, {"type": "esriPMS", "url": "b.png"})]) == [],
           "picture marker classes differ by more than color")
+    check(rules(layers=[uv({"type": "esriPMS", "url": "a.png", "color": red},
+                           {"type": "esriPMS", "url": "a.png", "color": blue})]) == [],
+          "picture markers are never judged color-only, even with a color array")
     check(rules(layers=[uv(sms(red), "junk")]) == [] and rules(layers=[uv(sms(red), {"type": "esriSMS"})]) == [],
           "a class with a malformed or colorless symbol is not judged")
     check(rules(layers=[{"title": "T", "layerDefinition": {"drawingInfo": {"renderer": {"type": "simple"}}}}]) == []
@@ -2157,12 +2396,37 @@ def _t_wcag(t):
 
 def _t_summary(t):
     check = t.check
+    edge = lambda ver, sev, views, app, mapt=None: dict(
+        dict(Verdict=ver, Severity=sev, AppViews=views, AppTitle=app), **({} if mapt is None else {"MapTitle": mapt}))
+    e1, e2, e3 = edge("BROKEN", "1 High", 9, "B", "m"), edge("BROKEN", "1 High", 9, "A", "z"), edge("BROKEN", "1 High", 9, "A", "y")
+    e4, e5, e6 = edge("BROKEN", "1 High", 90, "Z", "m"), edge("UNKNOWN", "2 Medium", 500, "A", "m"), edge("OK", "", 1000, "A", "m")
+    e7 = edge("BROKEN", "1 High", 9, "A")
+    e8, e9 = edge("BROKEN", "1 High", None, "N", "m"), edge("BROKEN", "1 High", 0, "N", "m")
+    check(edge_order([e9, e8]) == [e9, e8] and edge_order([e8, e9]) == [e8, e9],
+          "an app with no view count sorts as 0 views")
+    check(edge_order([e6, e5, e1, e2, e3, e7, e4]) == [e4, e7, e3, e2, e1, e5, e6],
+          "edges sort findings before clean rows, then audience, busiest app, app title and map title  <-- pinned defect")
+    wc = lambda sev, views, mapt, rule, layer: dict(Severity=sev, MapViews=views, MapTitle=mapt, Rule=rule, Layer=layer)
+    w1, w2, w3 = wc("1 High", 9, "B", "r1", "l"), wc("1 High", 9, "A", "r2", "l"), wc("1 High", 9, "A", "r1", "z")
+    w4, w5, w6 = wc("1 High", 9, "A", "r1", "y"), wc("1 High", 90, "Z", "r", "l"), wc("2 Medium", 500, "A", "r", "l")
+    w7 = wc("1 High", None, "A", "r", "l")
+    w8 = wc("1 High", 0, "A", "r", "l")
+    check(wcag_order([w8, w7]) == [w8, w7] and wcag_order([w7, w8]) == [w7, w8],
+          "a map with no view count sorts as 0 views")
+    check(wcag_order([w6, w7, w1, w2, w3, w4, w5]) == [w5, w4, w3, w2, w1, w7, w6],
+          "accessibility rows sort by audience, busiest map, map title, rule and layer  <-- pinned defect")
     rows = [{"Verdict": "OK", "MapTitle": "A", "MapAccess": "public", "MapViews": 1, "MapOwner": "x"},
             {"Verdict": "BROKEN", "MapTitle": "B", "MapAccess": "org", "MapViews": 2, "MapOwner": "y",
              "Overexposed": "Yes"},
             {"Verdict": "BROKEN", "MapTitle": "B", "MapAccess": "org", "MapViews": 2, "MapOwner": "y"},
             {"Verdict": "DEAD", "MapTitle": "C", "MapAccess": "org", "MapViews": 3, "MapOwner": "z"},
             {"Section": "<error>", "MapTitle": "D", "MapAccess": "org", "MapViews": 0, "MapOwner": "z"}]
+    tie = [{"Verdict": "BROKEN", "MapTitle": t, "MapAccess": "org", "MapViews": 1, "MapOwner": o}
+           for t, o in (("Zed", "zoe"), ("Abe", "abe"))]
+    out = summary_rows(tie, {})
+    check([m for s, m, v in out if s == "Worst maps"] == ["Abe (org, 1 views)", "Zed (org, 1 views)"]
+          and [m for s, m, v in out if s == "Top owners"] == ["abe", "zoe"],
+          "equal counts are listed by name, whatever order the rows came in  <-- pinned defect")
     out = summary_rows(rows, {"maps scanned": 4})
     d = dict(((s, m), v) for s, m, v in out)
     check(d[("Run", "maps scanned")] == 4 and d[("Verdicts", "OK")] == 1 and d[("Verdicts", "BROKEN")] == 2
@@ -2233,7 +2497,7 @@ def _t_login(t):
         check(connect() == "loaded", "connect() loads the ArcGIS library when it is not loaded yet")
 
 
-def _t_cli(t):
+def _t_cli(t, tmp):
     check = t.check
     p = build_parser()
 
@@ -2263,6 +2527,29 @@ def _t_cli(t):
           "--edges and --wcag are off unless given, so a plain run is unchanged")
     check(build_parser().parse_args([]).out != "" and OUTPUT_PREFIX in build_parser().parse_args([]).out,
           "the default output name uses the configured prefix")
+
+    # -o is judged before the audit: a refusal after a multi-minute run loses the run
+    folder = os.path.join(tmp, "cli_folder")
+    os.mkdir(folder)
+    old = os.path.join(tmp, "cli_old.xlsx")
+    with open(old, "wb") as fh:
+        fh.write(b"old")
+    nodir = os.path.join(tmp, "cli_nodir") + "/"
+    check(output_problem(os.path.join(tmp, "cli_new.xlsx"), False) is None and output_problem(old, True) is None
+          and "already exists; add --apply" in output_problem(old, False),
+          "a new name, or an old one with --apply, is accepted; an old one without it is not")
+    check(all("names a folder, not a file" in output_problem(x, ap) for x in (folder, folder + "/", nodir)
+              for ap in (False, True)) and not os.path.exists(nodir),
+          "an existing folder, or a name that ends in a slash, is refused with or without --apply  <-- pinned defect")
+    check("is empty" in output_problem("", False) and "is empty" in output_problem("  ", True)
+          and "does not exist" in output_problem(os.path.join(tmp, "cli_gone", "r.xlsx"), False),
+          "an empty -o and a missing folder are refused")
+    contacted = []
+    for what, bad in (("an empty name", ""), ("an existing folder", folder), ("a name ending in a slash", nodir)):
+        with _patched(connect=lambda: contacted.append(1)), _quiet() as (_o, err):
+            code = _exits(lambda: main(["-o", bad, "--apply"]))
+        check(code == 2 and not contacted and "error:" in err.getvalue(),
+              "main() refuses -o with %s, exit 2, before it signs in  <-- pinned defect" % what)
 
 
 def _t_source(t):
@@ -2328,7 +2615,7 @@ def _t_report(t, tmp, rest):
         df = frame(rows, ALL_COLS)
         findings = df[df.Verdict != "OK"][FIND_COLS]
         xlsx = os.path.join(tmp, "direct.xlsx")
-        edf = frame([{"AppUrl": "https://p/a", "MapUrl": "https://p/m"}], EDGE_COLS)
+        edf = frame([{"AppUrl": "https://p/a", "MapUrl": "https://p/m"}, {"AppUrl": "https://p/b"}], EDGE_COLS)
         write_excel(xlsx, findings, df, summarize(rows, {"k": "v"}), [("Edges", edf, ("AppUrl", "MapUrl"))])
         wb = openpyxl.load_workbook(xlsx)
         check(wb.sheetnames == ["Findings", "AllLayers", "Summary", "Edges"], "the workbook has the three sheets and the extra one")
@@ -2336,6 +2623,12 @@ def _t_report(t, tmp, rest):
         check(f["A1"].value == "Severity" and f.freeze_panes == "A2" and f["D2"].value == "=evil()"
               and f["D2"].data_type == "s", "headers are frozen and a formula-shaped title is stored as text")
         check(f["H2"].hyperlink is not None and f["I2"].value == "L", "map links are live and control characters are gone")
+        check(f.auto_filter.ref == f.dimensions and f["H2"].style == "Hyperlink"
+              and f.column_dimensions["A"].width == len("Severity") + 2 and f["A2"].style == "Normal",
+              "the sheet has a filter, sized columns and link styling on the link cells only")
+        check(wb["Edges"]["Q3"].hyperlink is None and wb["Edges"]["Q3"].style == "Normal"
+              and wb["Edges"]["Q2"].hyperlink is not None,
+              "an empty link cell gets no link")
         check(wb["Edges"]["K2"].hyperlink is not None, "extra sheets get live links on the columns they name")
         summ = summarize(rows, {})
         target = os.path.join(tmp, "locked.xlsx")
@@ -2349,11 +2642,14 @@ def _t_report(t, tmp, rest):
         with _patched(open=locked_open), _quiet() as (out, _):
             written = save_report(target, findings, df, summ, (), True)
         check(written != target and os.path.exists(written) and not os.path.exists(target)
-              and "is locked" in out.getvalue(),
+              and "is locked" in out.getvalue() and "instead of %s" % target in out.getvalue(),
               "a locked report is written under a second name, never lost  <-- pinned defect")
         free = os.path.join(tmp, "free.xlsx")
-        check(save_report(free, findings, df, summ) == free and os.path.exists(free),
-              "an unlocked report is written where it was asked to be")
+        with _quiet() as (out, _):
+            where = save_report(free, findings, df, summ)
+        check(where == free and os.path.exists(free) and out.getvalue() == "",
+              "an unlocked report is written where it was asked to be, with nothing printed")
+
 
         # a name that appeared during the run is never replaced without --apply
         late = os.path.join(tmp, "late.xlsx")
@@ -2367,7 +2663,8 @@ def _t_report(t, tmp, rest):
         with real_open(late, "rb") as fh:
             kept = fh.read()
         check(kept == b"first run" and second.endswith("late_120005.xlsx") and third.endswith("late_120005_2.xlsx")
-              and "already exists and --apply was not given" in out.getvalue(),
+              and "already exists and --apply was not given" in out.getvalue()
+              and "instead of %s" % late in out.getvalue(),
               "a report that appeared during the run is not replaced without --apply, and a same-second "
               "rerun does not overwrite the first  <-- pinned defect")
         with _patched(datetime=noon), _quiet():
@@ -2388,9 +2685,13 @@ def _t_report(t, tmp, rest):
         def never_open(name, mode="r"):
             raise PermissionError("denied")
 
+        denied = None
         with _patched(open=never_open), _quiet():
-            t.raises(lambda: save_report(free, findings, df, summ, (), True),
-                     "when no name can be written the error is raised, not looped on", exc=PermissionError)
+            try:
+                save_report(free, findings, df, summ, (), True)
+            except PermissionError as e:
+                denied = e
+        check(denied is not None, "when no name can be written the error is raised, not looped on")
 
         # the whole run, against the stub and a fake portal
         org = "org1"
@@ -2405,7 +2706,7 @@ def _t_report(t, tmp, rest):
         pool = dict((i.id, i) for i in (
             _Item(m1, title="Visitor map", owner="alice", access="public", data=pub_map, snippet="Visitor finder"),
             _Item(m2, title="Untitled Map", owner="alice", access="org", data=bad_map),
-            _Item(m3, title="Staff map", owner="alice", access="org", data={}, snippet="s"),
+            _Item(m3, title="Staff map", owner="alice", access="org", data=_BLANK_MAP, snippet="s"),
             _Item(lay, title="Org layer", owner="bob", access="org", kind="Feature Service", orgId=org),
             _Item(dash, title="Public board", owner="alice", access="public", kind="Dashboard",
                   data={"widgets": [{"itemId": m3}, {"itemId": lay}]}),
@@ -2441,6 +2742,10 @@ def _t_report(t, tmp, rest):
               and "  2 app edges, 1 not openable by every viewer" in out and "  4 accessibility findings" in out
               and "Read 2 apps (0 unreadable)" in out,
               "a full run exits 0, writes the report and prints the console lines the README quotes")
+        check(all(line in out.split("\n") for line in (
+            "Connected to Test Org as admin", "Scanning 3 web maps...", "6 layer refs, 2 distinct layer items",
+            "  OK       3", "  BROKEN   2", "  DEAD     1")) and "  3/3 maps  " in out,
+              "the console shows the connection, the scan, the layer counts and each verdict count")
         wb = openpyxl.load_workbook(out_path)
         check(wb.sheetnames == ["Findings", "AllLayers", "Summary", "Edges", "WCAG"],
               "--edges and --wcag add their own sheets, got %s" % wb.sheetnames)
@@ -2456,7 +2761,7 @@ def _t_report(t, tmp, rest):
               "the untitled, summary-less map yields four rule rows, got %s" % wrows)
         summary = dict(((r[0], r[1]), r[2]) for r in wb["Summary"].iter_rows(min_row=2, values_only=True))
         check(summary[("Edges", "BROKEN")] == 1 and summary[("WCAG", "layer-no-title")] == 1
-              and summary[("Run", "apps scanned")] == 2
+              and summary[("Run", "apps scanned")] == 2 and summary[("Run", "elapsed s")] >= 0
               and summary[("Run", "candidate ids that were not web maps")] == "not a web map 1",
               "the summary counts the edges, the rules and the candidates that were not maps")
         check("Traceback" not in err, "a clean run prints no traceback")
@@ -2473,7 +2778,8 @@ def _t_report(t, tmp, rest):
         check(code == 0 and get(out_path, 2) == b"PK", "--apply replaces it")
 
         empty = os.path.join(tmp, "empty.xlsx")
-        with _patched(connect=lambda: gis):
+        # a real run starts with the report libraries not loaded, so main() must load them itself
+        with _patched(connect=lambda: gis), _patched(pd=None, get_column_letter=None):
             code, out, _err = run(["-o", empty, "--limit", "0", "--edges", "--wcag"])
         check(code == 0 and "Scanning 0 web maps" in out and os.path.exists(empty),
               "--limit 0 means zero, and an empty audit still writes its report  <-- pinned defect")
@@ -2497,8 +2803,8 @@ def _t_report(t, tmp, rest):
 
         # --limit must not hide the groups of a map that only an app embeds
         pool_lim = dict((i.id, i) for i in (
-            _Item(_hid(30), title="Front", owner="alice", access="public", data={}, snippet="s"),
-            _Item(_hid(1), title="Embedded", owner="alice", access="shared", data={}, snippet="s"),
+            _Item(_hid(30), title="Front", owner="alice", access="public", data=_BLANK_MAP, snippet="s"),
+            _Item(_hid(1), title="Embedded", owner="alice", access="shared", data=_BLANK_MAP, snippet="s"),
             _Item(_hid(20), title="Board", owner="alice", access="shared", kind="Dashboard",
                   data={"widgets": [{"itemId": _hid(1)}]})))
         lim_path = os.path.join(tmp, "lim.xlsx")
@@ -2514,7 +2820,7 @@ def _t_report(t, tmp, rest):
                 ("a map that cannot be read", {_hid(50): _Item(_hid(50), data=RuntimeError("x"))},
                  ["-o", os.path.join(tmp, "bad.xlsx")]),
                 ("an app that cannot be read",
-                 {_hid(51): _Item(_hid(51), data={}),
+                 {_hid(51): _Item(_hid(51), data=_BLANK_MAP),
                   _hid(52): _Item(_hid(52), kind="Dashboard", data=RuntimeError("x"))},
                  ["-o", os.path.join(tmp, "app.xlsx"), "--edges"])):
             with _patched(connect=lambda items_=items_: _Gis(rest, items_)):
@@ -2526,14 +2832,14 @@ def _t_report(t, tmp, rest):
         m_org, m_lost, m_grp = _hid(60), _hid(61), "boom"
         board = lambda n, *ids: _Item(_hid(n), title="Board", owner="alice", access="public", kind="Dashboard",
                                       data={"widgets": [{"itemId": i} for i in ids]})
-        base_pool = [_Item(_hid(62), title="Front", owner="alice", access="public", data={}, snippet="s"),
-                     _Item(m_org, title="Staff", owner="alice", access="org", data={}, snippet="s")]
+        base_pool = [_Item(_hid(62), title="Front", owner="alice", access="public", data=_BLANK_MAP, snippet="s"),
+                     _Item(m_org, title="Staff", owner="alice", access="org", data=_BLANK_MAP, snippet="s")]
         cases = (
             ("an embedded map whose lookup failed", base_pool + [board(63, m_org)], {"fail_ids": [m_org]}, 3,
              "item ids could not be looked up", "web map lookup failed"),
             ("an embedded map that matches no item", base_pool + [board(64, m_lost)], {}, 0,
              "", "matches no item"),
-            ("a group lookup that failed", base_pool + [_Item(m_grp, title="Boom", access="public", data={},
+            ("a group lookup that failed", base_pool + [_Item(m_grp, title="Boom", access="public", data=_BLANK_MAP,
                                                               snippet="s")], {}, 3,
              "items have no group data", None),
             ("an account without View all content", base_pool, {"privileges": []}, 3,
@@ -2555,9 +2861,9 @@ def _t_report(t, tmp, rest):
 
         # sheet order and the console lines the README quotes
         gis_ = _Gis(rest, dict((i.id, i) for i in (
-            _Item(_hid(70), title="Zed", owner="alice", access="org", data={}, snippet="s", numViews=1),
-            _Item(_hid(71), title="Untitled Map", owner="alice", access="public", data={}, numViews=5),
-            _Item(_hid(75), title="Hidden", owner="alice", access="private", data={}, snippet="s"),
+            _Item(_hid(70), title="Zed", owner="alice", access="org", data=_BLANK_MAP, snippet="s", numViews=1),
+            _Item(_hid(71), title="Untitled Map", owner="alice", access="public", data=_BLANK_MAP, numViews=5),
+            _Item(_hid(75), title="Hidden", owner="alice", access="private", data=_BLANK_MAP, snippet="s"),
             _Item(_hid(72), title="Org board", owner="alice", access="org", kind="Dashboard", numViews=1,
                   data={"widgets": [{"itemId": _hid(75)}]}),
             _Item(_hid(73), title="Open board", owner="alice", access="public", kind="Dashboard", numViews=9,
@@ -2575,6 +2881,22 @@ def _t_report(t, tmp, rest):
               "edges list findings first, then by audience, and the console counts match the sheets, got %s" % edges)
         check(wc == [("1 High", "map-no-summary"), ("1 High", "map-title-placeholder")],
               "accessibility rows are worst audience first, got %s" % wc)
+
+        # the Findings sheet: worst audience first, busiest map first, then by title and layer
+        def dead_map(n, title, access, views):
+            data = {"operationalLayers": [{"title": "L2", "itemId": "gone2"}, {"title": "L1", "itemId": "gone1"}]}
+            return _Item(_hid(n), title=title, owner="alice", access=access, data=data, snippet="s", numViews=views)
+
+        gis_ = _Gis(rest, dict((i.id, i) for i in (
+            dead_map(80, "Alpha", "public", 5), dead_map(81, "Charlie", "org", 99),
+            dead_map(82, "Bravo", "public", 50), dead_map(83, "Able", "public", 50))))
+        ranked = os.path.join(tmp, "ranked.xlsx")
+        with _patched(connect=lambda: gis_):
+            code, out, err = run(["-o", ranked])
+        found = [(r[3], r[8]) for r in openpyxl.load_workbook(ranked)["Findings"].iter_rows(min_row=2, values_only=True)]
+        check(found == [("Able", "L1"), ("Able", "L2"), ("Bravo", "L1"), ("Bravo", "L2"), ("Alpha", "L1"),
+                        ("Alpha", "L2"), ("Charlie", "L1"), ("Charlie", "L2")],
+              "Findings lists the most-visited broken public map first, ties by title and layer, got %s" % found)
 
         # a folder that does not exist is refused before any portal call
         gone = os.path.join(tmp, "no_such_folder", "r.xlsx")
@@ -2594,6 +2916,8 @@ def _t_report(t, tmp, rest):
         wb = openpyxl.load_workbook(deep)
         head = [c.value for c in wb["AllLayers"][1]]
         check(code == 0 and head[-2:] == ["FeatureCount", "LastEditUTC"], "--deep adds the count and last-edit columns")
+        check("Read " not in out and "app edges" not in out and "accessibility findings" not in out,
+              "a run without --edges and --wcag prints neither the app nor the accessibility lines")
         blob = out + err + "".join(_zip_text(deep))
         check(secret not in blob, "the password reaches neither the console nor the report")
         check(wb.sheetnames == ["Findings", "AllLayers", "Summary"], "without --edges and --wcag the workbook is unchanged")
@@ -2641,17 +2965,31 @@ def build_parser():
     return p
 
 
+def output_problem(path, apply):
+    """Why -o cannot be written, or None.  Checked before the audit, because a refusal after a
+    multi-minute run loses the run.  It cannot tell whether the account may write the folder."""
+    if not path.strip():
+        return "-o is empty; give a file name that ends in .xlsx"
+    if path.endswith(("/", os.sep)) or os.path.isdir(path):
+        return "%s names a folder, not a file; give a file name such as %s" % (
+            path, os.path.join(path, "report.xlsx"))
+    folder = os.path.dirname(os.path.abspath(path))
+    if not os.path.isdir(folder):
+        return "the folder %s does not exist; create it or choose another -o" % folder
+    if os.path.exists(path) and not apply:
+        return "%s already exists; add --apply to replace it" % path
+    return None
+
+
 def main(argv=None):
     p = build_parser()
     a = p.parse_args(argv)
     if a.self_test:
         return self_test()
     # Refuse before the multi-minute audit, not after it.  A new file needs no flag.
-    folder = os.path.dirname(os.path.abspath(a.out))
-    if not os.path.isdir(folder):
-        p.error("the folder %s does not exist; create it or choose another -o" % folder)
-    if os.path.exists(a.out) and not a.apply:
-        p.error("%s already exists; add --apply to replace it" % a.out)
+    problem = output_problem(a.out, a.apply)
+    if problem:
+        p.error(problem)
     load_report_libs()
 
     t0 = time.time()
