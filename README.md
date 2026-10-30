@@ -13,7 +13,7 @@ A sharing audit that reads each item on its own passes this. The map is consiste
 layers. The dashboard is consistent with itself. The fault is on the edge between them: the app
 reaches a wider audience than the map it embeds.
 
-sightline checks every edge, from the layer up to the app. For every layer in every web map, it
+sightline checks the edges it can find, from the layer up to the app. For every layer in every web map, it
 answers one question:
 
 > Is every viewer of the **map** also a viewer of the **layer**?
@@ -76,8 +76,22 @@ and I read only their descriptions. I did not run them.
   accessible text descriptions for web maps with an AI model. sightline does not write
   descriptions. It only tells you which maps have none.
 
-The search showed no tool that compares an app's audience with the audience of the map it
-embeds. That shows only what the search found. A search for the name `sightline` on 2026-10-29
+[JoeGuzi/ArcGIS-Online-Web-Application-Audit](https://github.com/JoeGuzi/ArcGIS-Online-Web-Application-Audit)
+(last pushed 2025-05-20) is the closest match. Its description says it audits the web
+applications in an organization, finds the web map each one uses, compares the sharing of the
+app and the map, and writes the result to Excel. It also writes a second sheet of web maps that
+no application uses. It has no licence file. I read its description and the head of its README
+and did not run it, so I cannot say how it decides. If you only need an app against map
+comparison and the unused-map list, try it first. sightline differs in what it states: it
+compares group sets by group id, it reports UNKNOWN where it cannot tell instead of a silent
+OK, it also checks each layer against its map, it adds the accessibility rules, and it exits
+`3` when the run was incomplete. I did not test the other tool against any of these points.
+
+sightline reads the live portal for its edges. The OSS plan for this tool named a different
+source for them, the dependency graph of whobreaks and the sharewatch snapshot. I chose the
+live read so that the answer is the sharing today, at the cost of one extra pass over the apps.
+
+That list shows only what the search found. A search for the name `sightline` on 2026-10-29
 returned other projects with that name (analytics, a game, a drone search tool). None audits
 ArcGIS content.
 
@@ -349,9 +363,15 @@ public would get:
 |---|---|
 | Normal | The layer really is public |
 | `401` `403` `498` `499` | Needs a token. In a public map this is BROKEN |
-| `400` `404` | The service is gone |
+| `400` `404` | The service is gone (ArcGIS REST services only) |
 | A 200 reply whose `error` is not an object with a code | UNKNOWN, reason `error reply of unknown shape` |
 | Connection failure | UNKNOWN, with the reason recorded |
+
+Only an ArcGIS REST service is probed: a layer whose `layerType` starts with `ArcGIS`, or
+whose url holds `/rest/services/`, or a layer with no `layerType` at all. A WMS, KML, CSV or
+other OGC layer reads UNKNOWN, reason `not an ArcGIS REST service; not probed`. The `400` rule
+was measured on ArcGIS services only. A healthy OGC server answers `400` to a request that
+lacks its own parameters, so the rule would call a working WMS layer DEAD.
 
 This catches a map titled "Internal" that is shared publicly and points at token-secured
 services. No data leaks, but the map is broken for every visitor.
@@ -431,7 +451,7 @@ What each rule rests on, checked against the sources:
   18 point, or 14 point bold.
 - The Esri web map specification says a layer `title` is "a user-friendly string title for the
   layer that can be used in a table of contents", that `disablePopup` indicates "whether to
-  allow a client to ignore popups", that labels display when `showLabels` is `true`, and that
+  allow a client to ignore the popups", that labels display when `showLabels` is `true`, and that
   `uniqueValueGroups` should be used instead of `uniqueValueInfos` when present. sightline
   reads `uniqueValueGroups` first for that reason. Colors are four-element arrays of red,
   green, blue and alpha, 0 to 255. Label `font.size` is in points. See the
@@ -495,6 +515,8 @@ PASS  a footer that exits 0 on a failure, or hides the count and the last line, 
 ...
 PASS  an org-only layer in a group-shared map is unknown, since a group can hold outside members  <-- pinned defect
 ...
+PASS  a WMS or KML layer is unknown, never dead or public; a REST url or ArcGIS type is probed  <-- pinned defect
+...
 PASS  a secured service never shows LayerAccess=public in AllLayers  <-- pinned defect
 ...
 PASS  a map with OSM, Bing, tile-template, style-url, embedded-group and nested-group layers has no false NO_TARGET finding  <-- pinned defect
@@ -523,10 +545,10 @@ PASS  Findings lists the most-visited broken public map first, ties by title and
 ...
 PASS  a map that cannot be read: the report is written and the exit code is 3, not 0  <-- pinned defect
 --------------------------------------------------------------------
-371 assertions, 0 failed
+376 assertions, 0 failed
 ```
 
-The full run prints all 371 assertions, each on its own `PASS` line. Each `...` line is where
+The full run prints all 376 assertions, each on its own `PASS` line. Each `...` line is where
 this block is cut.
 Lines marked `<-- pinned defect` are cases where a real defect was found, or could return, and
 the assertion keeps it from coming back.
@@ -536,34 +558,36 @@ host that lacks them:
 
 | Host | Python | Packages | Count |
 |---|---|---|---|
-| Windows, ArcGIS Pro conda environment | 3.13.7 | pandas 2.3.0, openpyxl 3.1.5, `arcgis` | 371 |
-| Windows, virtual environment | 3.13.2 | pandas 3.1.0, openpyxl 3.1.5 | 371 |
-| Windows, virtual environment | 3.9.25 | pandas 2.3.3, openpyxl 3.1.5 | 371 |
-| Linux, virtual environment | 3.12.3 | pandas 3.1.0, openpyxl 3.1.5 | 371 |
-| Windows, plain `C:\Python313` run with `-I` | 3.13.2 | none | 320 |
-| Windows, plain Python | 3.9.25 | none | 320 |
-| Linux, system `python3` | 3.12.3 | none | 320 |
+| Windows, ArcGIS Pro conda environment | 3.13.7 | pandas 3.0.3, openpyxl 3.1.5, `arcgis` 2.4.2 | 376 |
+| Windows, plain `C:\Python313` | 3.13.2 | pandas 3.0.3, openpyxl 3.1.5 (user site) | 376 |
+| Linux, virtual environment | 3.12.3 | pandas 3.1.0, openpyxl | 376 |
+| Windows, virtual environment | 3.13.2 | pandas 3.0.5, no `openpyxl` | 325 |
+| Windows, plain `C:\Python313` run with `-I` | 3.13.2 | none visible | 325 |
+| Linux, system `python3` | 3.12.3 | none | 325 |
+
+No Python 3.9 interpreter was available, so Python 3.9 was not run. The self-test parses the
+source with `ast.parse(..., feature_version=(3, 9))`, and the file has no f-string.
 
 The self-test never imports `arcgis` or `arcpy`, so they change nothing. On a Python without
 `pandas` or `openpyxl`, 51 Excel assertions do not run. The run prints `SKIP  report writer`
-where they would be, and a second `SKIP` line above the footer. The count drops to 320. The
+where they would be, and a second `SKIP` line above the footer. The count drops to 325. The
 run still ends `0 failed` and exits `0`, so read the `SKIP` line before you trust the footer.
-Windows and Linux therefore agree: 371 with the two packages, 320 without. They differ only
+Windows and Linux therefore agree: 376 with the two packages, 325 without. They differ only
 by which packages a given interpreter can import. Plain `C:\Python313` on the author's
-machine finds `pandas` in its user site folder, so a default run there prints 371; `-I` (or
-`PYTHONNOUSERSITE=1`) hides the user site and prints 320. The Linux production host's system
-`python3` has no `pandas`, and nothing was installed on it for this work. The 371 on Linux
+machine finds `pandas` in its user site folder, so a default run there prints 376; `-I` (or
+`PYTHONNOUSERSITE=1`) hides the user site and prints 325. The Linux production host's system
+`python3` has no `pandas`, and nothing was installed on it for this work. The 376 on Linux
 ran in a separate virtual environment.
 
 The PASS lines and the footer agree: a run prints one `PASS` line for each assertion.
 
-`coverage run --branch sightline.py --self-check` reports 100 percent of 1799 statements and
-408 branches (coverage.py 7.17.0) on Windows, Python 3.13.2, and on Linux, Python 3.12.3, both
-with `pandas` and `openpyxl` installed. On the same Windows machine, in an environment that
-has coverage.py 7.16.1 but not `openpyxl`, the figure is 84 percent: 305 statements and 2
-branches are missed. They are `frame()`, `summarize()`, `save_report()`, `defuse()`, `scrub()`, `write_excel()`,
-`_t_report()`, and the part of `main()` that follows the report-library load, none of which can
-run without the two packages.
+`coverage run --branch sightline.py --self-check` reports 100 percent of 1827 statements and
+410 branches. Two runs gave that figure: coverage.py 7.16.1 on Windows, with the ArcGIS Pro
+Python 3.13.7, and coverage.py 7.17.0 on Linux, in the virtual environment with Python 3.12.3.
+Both have `pandas` and `openpyxl`. In an environment with coverage.py but without `openpyxl`,
+the Excel writer and the whole-run tests cannot run, and the figure falls to about 84 percent:
+`frame()`, `summarize()`, `save_report()`, `defuse()`, `scrub()`, `write_excel()`, `_t_report()`,
+and the part of `main()` that follows the report-library load are missed.
 
 ## Limits
 
@@ -613,8 +637,10 @@ run without the two packages.
 - **The probe reads a whole response body.** The timeout applies to each read, not to the
   whole reply. A service that streams forever, or sends a byte at a time, can hang the run or
   use all memory.
-- **The probe reads any JSON object with no `error` key as PUBLIC.** That includes a reply
-  from a service that is not an ArcGIS service.
+- **The probe reads any JSON object with no `error` key as PUBLIC.** A layer with no
+  `layerType` and a url outside `/rest/services/` is still probed, and a non-ArcGIS service
+  that answers JSON there reads PUBLIC. A layer with a type other than `ArcGIS...` is not
+  probed (see "Layers that are not items").
 - **A string error code is UNKNOWN.** A reply such as `{"error": {"code": "498"}}` is not
   classed SECURED, because the code table holds integers only.
 - **Malformed layer urls trip the host circuit breaker.** Three urls with a space, a control
@@ -654,7 +680,10 @@ run without the two packages.
 - **Error text is copied into the report.** The text of a failed request or read goes into
   the `Reason` column and the console as the exception gives it. An exception that echoes its
   request url could carry a token from a legacy token-in-query login. `clean_url()` cleans the
-  layer url columns only.
+  layer url columns. `redact()` removes credential-named query values and `user:password@`
+  parts from the text of a failed group lookup, item lookup, map read or app read before it is
+  printed or stored. It works on the parameter name, like `clean_url()`, so a percent-encoded
+  name or a value under another name is not removed.
 - **An item title with a lone surrogate stops the Excel write.** It is reachable only through
   the REST API, and it raises `UnicodeEncodeError` at the end of the run.
 - **A title longer than 32767 characters is cut.** openpyxl cuts it in the workbook without a
@@ -667,8 +696,54 @@ run without the two packages.
   repair the file. Do not click links in a report from an organization you do not trust.
 - **`fetch_groups()` expects the reply shape it knows.** A group block that is not an object
   raises an `AttributeError`. This needs a malformed reply.
-- **`connect()` ignores `ARCGIS_PASS` when a Pro session is found.** That happens when no
-  username is set.
+- **`connect()` ignores `ARCGIS_PASS` and `ARCGIS_URL` when a Pro session is found.** That
+  happens when no username is set, so the run can audit a different portal than the one
+  configured. Only the `Connected to` line shows which.
+- **`--deep` counts only layers on the portal host or an `arcgis.com` host.** Every other
+  layer keeps a blank `FeatureCount` and gets the text `skipped: not a portal or arcgis.com host`
+  in `LastEditUTC`, so an Enterprise site with a separate server host gets no counts.
+- **A run in which every service probe fails still exits `0`.** With the network or a proxy
+  down, the url-only layers read `UNKNOWN` with a reason such as `RemoteDisconnected` or
+  `host circuit-open`, and nothing marks the run `INCOMPLETE`.
+- **A token inside a layer url is dropped before the probe.** A token-secured service whose
+  map url carries a valid token reads SECURED, and BROKEN in a public map, although the
+  embedded token does let anonymous viewers load it.
+- **A malformed item id goes into the search query unquoted.** An id with a trailing newline
+  (the `$` in `ID_RE` matches before it), a quote or a parenthesis, in an app or a web map,
+  changes the `id:(a OR b ...)` query for its whole chunk of 50 ids. The valid ids in that
+  chunk can then read `DEAD` or `UNKNOWN`. It needs a hostile or corrupt item.
+- **An app can keep a web map id after the widget is removed.** An unused Experience Builder
+  data source is one example. sightline reports that id as an edge, so the edges it reports are
+  real only for ids that are still embedded.
+- **A bare run with no credentials and no Pro session was seen to hang past 30 seconds**
+  once, with no report and no traceback. The cause was not isolated. It may be the
+  `GIS("pro")` attempt.
+- **`save_report` with `--apply` truncates the old report before it writes.** A full disk
+  during the write loses the previous report.
+- **The renderer and label rules read only what the web map stores.** `renderer-color-only`
+  and `label-halo-contrast` look at `layerDefinition.drawingInfo`, so a layer drawn with its
+  service's default style or labels is never judged. A clean WCAG sheet says nothing about it.
+- **`renderer-color-only` is advisory.** It fires on any unique-value layer whose classes
+  differ only by fill color. That includes ordinary categorical maps that also have a text
+  legend. Treat every hit like `layer-popup-off`.
+- **The WCAG criterion numbers are the author's judgement.** Success criteria 1.1.1 for
+  `map-no-summary` and 2.4.2 for `map-title-placeholder` are written for page content, not
+  for ArcGIS item metadata.
+- **The Esri Share dialog was not checked.** I could not confirm whether it warns about
+  related items, so "I found no sharing comparison" covers the item pages and the documents I
+  read, not Esri's whole interface.
+- **Some behaviour is not pinned by any assertion.** A mutation sweep left these alive:
+  changing `if errors or app_errors:` in `incomplete_reasons()` to `and` (the unit check only
+  passes both lists together); the criterion number of each rule in `WCAG_RULES`; the
+  `webmapId` and `mapId` entries of `MAP_KEYS`; the placeholder titles `new map`, `map` and
+  `web map`; the order of the Top owners rows; the `FeatureCount` and `LastEditUTC` column
+  order; `len(apps) + len(app_errors)` in the app counts when no app is unreadable; and making
+  the `templateUrl`, `styleUrl` or `BUILTIN_TYPES` tests in `_has_target()` conjunctive.
+- **The contrast boundaries are not pinned.** A ratio of exactly 4.5 or 3.0 (`ratio < need`)
+  and the sRGB 0.04045 threshold have no fixture, because no 8-bit gray gives an exact ratio.
+- **`clean_url()` misses some credential names.** `jwt`, `session`, `sessionid` and `bearer`
+  are not in the list, so a value under one of them stays in the report and is sent by the
+  probe.
 - **`USERNAME` and `PASSWORD` in the config block win over the environment.** The safe
   path, an environment variable or the prompt, is a convention. Nothing enforces it.
 - **The Mass.gov link was not opened by the author.** The page returned HTTP 403 to a
@@ -677,7 +752,7 @@ run without the two packages.
   comes from scheduled-task experience. The self-test does not trigger it. The wrapper above
   ran in the self-test environment, and `arcgis.gis` imported with `arcpy` blocked.
 - **Coverage on a bare interpreter is 84 percent.** Without pandas and openpyxl the
-  Excel writer and the whole-run tests cannot execute, so 305 statements are missed.
+  Excel writer and the whole-run tests cannot execute, so about 300 statements are missed.
   With both libraries it is 100 percent, so every line is reachable offline.
 - **A run that hits a ceiling stops early and still exits `0`.** `MAX_MAPS` and `MAX_APPS`
   are 10000, which is also the hard limit of the `arcgis` search (it raises above 10000).

@@ -193,6 +193,10 @@ FS_RE = re.compile(r"/featureserver/\d+/?$")          # strict: the service ROOT
 # its hyperlinks, so these never leave clean_url().  A heuristic on the NAME, not the value.
 SECRET_PARAM_RE = re.compile(r"token|key|pass|pwd|secret|sig|auth|credential", re.I)
 USERINFO_RE = re.compile(r"^([A-Za-z][A-Za-z0-9+.-]*://)[^/]*@")
+# The same names inside free text.  An exception from requests quotes the full request url,
+# and with token-in-query signing that url carries the session token.
+SECRET_TEXT_RE = re.compile(r"([\w%%.-]*(?:%s)[\w%%.-]*=)[^&\s'\")]*" % SECRET_PARAM_RE.pattern, re.I)
+USERINFO_TEXT_RE = re.compile(r"(://)[^/\s@]+@")
 
 
 # --------------------------------------------------------------------------- plumbing
@@ -252,6 +256,11 @@ def clean_url(url):
     head = USERINFO_RE.sub(r"\1", head)
     keep = [q for q in query.split("&") if q and not SECRET_PARAM_RE.search(q.split("=")[0])]
     return head + ("?" + "&".join(keep) if keep else "")
+
+
+def redact(text):
+    """Exception text with credential-named query values and url userinfo removed."""
+    return USERINFO_TEXT_RE.sub(r"\1", SECRET_TEXT_RE.sub(r"\1[removed]", str(text)))
 
 
 def item_url_base(gis):
@@ -337,7 +346,7 @@ def collect(gis, maps, wcag_out=None):
                 raise ValueError(why)
             walk(data, found)
         except Exception as e:
-            errors.append((meta, "%s: %s" % (type(e).__name__, e)))
+            errors.append((meta, "%s: %s" % (type(e).__name__, redact(e))))
         else:
             for section, lyr in found:
                 refs.append((meta, section, lyr))
@@ -365,7 +374,7 @@ def resolve_items(gis, ids):
             hits = gis.content.search(query="id:(" + " OR ".join(chunk) + ")",
                                       max_items=len(chunk) * 2, outside_org=True)
         except Exception as e:
-            print("  item batch failed (%s: %s), %d ids unresolved" % (type(e).__name__, e, len(chunk)))
+            print("  item batch failed (%s: %s), %d ids unresolved" % (type(e).__name__, redact(e), len(chunk)))
             unresolved.update(chunk)
             continue
         for it in hits:
@@ -385,7 +394,7 @@ def fetch_groups(gis, ids):
         try:
             resp = gis._con.get(url, {"f": "json", "items": ",".join(chunk)}) or {}
         except Exception as e:
-            print("  group batch failed (%s: %s), %d ids unknown" % (type(e).__name__, e, len(chunk)))
+            print("  group batch failed (%s: %s), %d ids unknown" % (type(e).__name__, redact(e), len(chunk)))
             continue
         for iid in chunk:
             gids.setdefault(iid, set())
@@ -410,6 +419,17 @@ def code_state(code):
     if code in DEAD_CODES:
         return ("DEAD", "code %s" % code)
     return ("UNKNOWN", "code %s" % code)
+
+
+def is_arcgis_rest(lyr, url):
+    """True when the layer is an ArcGIS REST service, the only kind the 400 = gone rule was measured on.
+
+    A layer with no layerType is probed (web maps always carry one, so that is a stripped
+    fixture); a WMS, KML, CSV or OGC layer is not, because a healthy OGC server answers 400
+    to a request that lacks its own parameters.
+    """
+    kind = lyr.get("layerType")
+    return not kind or kind.startswith("ArcGIS") or "/rest/services/" in url.lower()
 
 
 def probe(url, cache, fails):
@@ -537,6 +557,8 @@ def build(refs, items, gids, gtitle, probes, fails, org_id, unresolved=()):
         lg, detail = None, ""
         if it is not None:
             state, la, lown, lg = "item", it["access"], it["owner"], gids.get(it.id)
+        elif url and not is_arcgis_rest(lyr, url):
+            state, detail = "UNKNOWN", "not an ArcGIS REST service; not probed"
         elif url:
             # Probe the SERVICE, not just the item: a deleted item whose service is still
             # public means the layer still draws.  Short-circuiting on the batch miss
@@ -632,7 +654,7 @@ def collect_apps(gis, limit):
                     raise ValueError(why)
                 apps.append((meta, map_candidates(data)))
             except Exception as e:
-                errors.append((meta, "%s: %s" % (type(e).__name__, e)))
+                errors.append((meta, "%s: %s" % (type(e).__name__, redact(e))))
     return apps, errors
 
 
@@ -1718,6 +1740,10 @@ def _t_core(t):
           "a map service layer is not countable")
     check(list(chunks(range(5), 2)) == [[0, 1], [2, 3], [4]] and list(chunks([], 3)) == [],
           "chunks() splits and tolerates nothing")
+    check(redact("GET /q?f=json&token=SECRET1&x=2 http://u:pw@h/a ?%74oken=Z access_token=Y")
+          == "GET /q?f=json&token=[removed]&x=2 http://h/a ?%74oken=Z access_token=[removed]"
+          and redact(ValueError("plain")) == "plain",
+          "redact() removes credential values and url userinfo from exception text  <-- pinned defect")
     check(host("https://a.example/x?y=1") == "a.example" and host(None) == "" and host("http://[bad") == "",
           "host() reads the netloc and survives None and a malformed url")
 
@@ -1765,6 +1791,19 @@ def _t_core(t):
     check(rows2[0]["LayerUrl"] == tidy and rows2[0]["LayerHost"] == "h.example"
           and "SECRET9" not in repr(rows2) and "pw" not in repr(rows2),
           "a token or password in a layer url never reaches a report row  <-- pinned defect")
+    # a live WMS answers 400 to a bare request; only an ArcGIS REST service is judged by that code
+    wms, kml = "https://w.example/ows/service", "https://k.example/layer.kml"
+    vt = "https://h.example/arcgis/rest/services/V/VectorTileServer"
+    cached = {wms: ("DEAD", "code 400"), kml: ("PUBLIC", ""), vt: ("PUBLIC", "")}
+    rows3 = build([(meta, "operationalLayers", {"url": wms, "layerType": "WMS"}),
+                   (meta, "operationalLayers", {"url": kml, "layerType": "KML"}),
+                   (meta, "operationalLayers", {"url": vt, "layerType": "VectorTileLayer"}),
+                   (meta, "operationalLayers", {"url": wms, "layerType": "ArcGISMapServiceLayer"})],
+                  {}, {}, {}, cached, collections.Counter(), org)
+    check([r["Verdict"] for r in rows3] == ["UNKNOWN", "UNKNOWN", "OK", "DEAD"]
+          and rows3[0]["Reason"] == "not an ArcGIS REST service; not probed"
+          and rows3[0]["LayerState"] == "UNKNOWN",
+          "a WMS or KML layer is unknown, never dead or public; a REST url or ArcGIS type is probed  <-- pinned defect")
     check(clean_url(None) == "" and clean_url("https://h/x?a=1&&b") == "https://h/x?a=1&b"
           and clean_url("https://h/x?access_token=1&Key=2&apikey=3&pwd=4&SIG=5") == "https://h/x"
           and clean_url("https://h/a@b/x") == "https://h/a@b/x" and clean_url("//h/x") == "//h/x"
@@ -1933,6 +1972,22 @@ def _t_portal(t, rest):
     check("boom" not in gids and gids["m1"] == {"g1", "g2"},
           "an item from a failed group chunk stays unknown  <-- pinned defect")
     check("group batch failed (HTTPError: HTTP Error 500" in out.getvalue(), "a failed group chunk is announced")
+
+    leaky = _Gis(rest, {})
+    leaky._con = types.SimpleNamespace(get=lambda url, params: (_ for _ in ()).throw(
+        RuntimeError("GET /itemsgroups?f=json&token=SECRET77 failed")))
+    leaky.content = types.SimpleNamespace(search=lambda **kw: (_ for _ in ()).throw(
+        RuntimeError("GET /search?token=SECRET77 failed")))
+    with _quiet() as (out, _):
+        fetch_groups(leaky, {"x1"})
+        resolve_items(leaky, {"x1"})
+    check("SECRET77" not in out.getvalue() and out.getvalue().count("token=[removed]") == 2,
+          "a session token quoted in a failed request never reaches the console  <-- pinned defect")
+    broken = [_Item("m4", title="Leak", data=RuntimeError("GET /data?token=SECRET77"))]
+    with _quiet():
+        _, leaked = collect(gis, broken)
+    check("SECRET77" not in repr(leaked) and "token=[removed]" in leaked[0][1],
+          "a session token quoted in a read error never reaches the report  <-- pinned defect")
 
     # collect(): good map, corrupt map, raising map; wcag rows ride along
     good = {"operationalLayers": [{"title": "A", "itemId": "l1"}]}
@@ -2560,6 +2615,9 @@ def _t_source(t):
     check(all(b < 128 for b in raw), "the source is pure ASCII")
     ast.parse(raw.decode("ascii"), feature_version=(3, 9))
     check(True, "the source parses as Python 3.9")
+    last = ast.parse(raw.decode("ascii")).body[-1]
+    check(isinstance(last, ast.If) and ast.dump(last.body[0]) == ast.dump(ast.parse("sys.exit(main())").body[0]),
+          "the script ends by exiting with main()'s return value, so exit codes 1 and 3 reach the shell  <-- pinned defect")
     spec = importlib.util.spec_from_file_location("sightline_imported", path)
     imported = importlib.util.module_from_spec(spec)
     buf = io.StringIO()
